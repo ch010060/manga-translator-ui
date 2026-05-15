@@ -237,6 +237,9 @@ MangaJaNaiConverterGui/
 
 # Scripts directory (脚本目录)
 scripts/
+!scripts/
+scripts/*
+!scripts/headless_batch_by_first_level_dirs.py
 
 # CatieCli directory (克隆的外部仓库)
 CatieCli/

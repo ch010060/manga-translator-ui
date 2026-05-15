@@ -78,6 +78,39 @@ python -m manga_translator local -i <输入> [选项]
 python -m manga_translator -i <输入> [选项]
 ```
 
+### 按书本目录平行批量处理
+
+如果根目录下的每个一级子目录都是一本书，可以使用批量 runner 让多本书平行处理；每本书会调用既有 `local` 模式，默认读取 GUI 使用的 `examples/config.json`，并加载项目根目录 `.env` 中的 API 设置。输出会写到该书自己的 `result` 子目录，每本书的详细 stdout/stderr 会保存到独立 log。
+
+```bash
+python scripts/headless_batch_by_first_level_dirs.py --root "D:\manga_root" --concurrency 2 --timeout 3600 --config examples/config.json --use-gpu
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--root` | 包含多本书的一层根目录 |
+| `--concurrency` | 同时处理的书本数量 |
+| `--timeout` | 单本书最大运行秒数，`0` 表示不限制 |
+| `--config` | 覆盖默认配置文件；未指定时使用 GUI 用户配置 `examples/config.json` |
+| `--result-dir-name` | 每本书内的输出目录名，默认 `result` |
+| `--skip-preflight` | 跳过启动前依赖检查，调试时才建议使用 |
+| `--preflight-timeout` | Sakura endpoint 等前置检查的超时秒数，默认 `3` |
+| `--force` | 即使 `result` 内已有足够输出图，也重新处理并覆盖 |
+| `--dry-run` | 只列出会处理或跳过的书，不启动翻译 |
+| `--subprocess` | 传给 `local` 模式，启用本项目既有的内存管理子进程 |
+
+批量 runner 只把每本书目录第一层的图片当作来源页，不递归处理子目录；这可以避免重跑时把 `result` 或 `manga_translator_work` 中的旧输出当作新输入。默认会跳过已完成的书；完成判断采用“第一层来源图片数 <= `result` 内图片数”。即使 GUI 配置中的 `cli.overwrite` 为 `true`，批量 runner 默认仍会传入 `--no-overwrite` 来跳过已有输出；只有指定 `--force` 时才会传入 `--overwrite` 重跑。
+
+如果配置使用 `sakura` 翻译器，启动 worker 前会先从项目根目录 `.env` 读取 `SAKURA_API_BASE`，并检查其 OpenAI-compatible `/models` endpoint；endpoint 未启动时会提早结束，不会提交任何书本任务。失败时主控台会列出失败书名与对应 log 路径。
+
+单本书也可以直接使用来源目录输出模式：
+
+```bash
+python -m manga_translator local -i "D:\manga_root\book_a" --save-to-source-dir --source-result-dir result
+```
+
 ### 必需参数
 
 | 参数 | 说明 | 示例 |
@@ -89,9 +122,13 @@ python -m manga_translator -i <输入> [选项]
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `-o`, `--output` | 输出目录 | 自动 |
+| `--save-to-source-dir` | 输出到每张原图所在目录下的结果子目录 | 关闭 |
+| `--source-result-dir` | 来源目录输出模式的结果子目录 | `manga_translator_work/result` |
 | `--config` | 配置文件路径 | 自动查找 |
 | `-v`, `--verbose` | 详细日志 | 关闭 |
 | `--overwrite` | 覆盖已存在文件 | 关闭 |
+| `--no-overwrite` | 不覆盖已存在输出文件，覆盖配置文件中的 `cli.overwrite` | 关闭 |
+| `--no-recursive` | 输入为文件夹时只处理第一层图片 | 关闭 |
 | `--use-gpu` | 使用 GPU 加速 | 配置文件 |
 | `--disable-onnx-gpu` | 禁用 ONNX Runtime GPU 加速 | 配置文件 |
 | `--format` | 输出格式（png/jpg/webp/avif） | 配置文件 |

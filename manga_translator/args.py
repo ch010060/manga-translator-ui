@@ -53,12 +53,20 @@ def create_parser():
                              help='输入图片或文件夹路径')
     local_parser.add_argument('-o', '--output', default=None,
                              help='输出目录（默认：同目录加 -translated 后缀）')
+    local_parser.add_argument('--save-to-source-dir', action='store_true',
+                             help='输出到每张原图所在目录下的结果子目录')
+    local_parser.add_argument('--source-result-dir', default='manga_translator_work/result',
+                             help='配合 --save-to-source-dir 使用的结果子目录（默认：manga_translator_work/result）')
     local_parser.add_argument('--config', default=None,
                              help='配置文件路径（默认：examples/config.json）')
     local_parser.add_argument('-v', '--verbose', action='store_true',
                              help='显示详细日志')
     local_parser.add_argument('--overwrite', action='store_true',
                              help='覆盖已存在的文件')
+    local_parser.add_argument('--no-overwrite', action='store_true',
+                             help='不覆盖已存在的输出文件（覆盖配置文件中的 overwrite）')
+    local_parser.add_argument('--no-recursive', action='store_true',
+                             help='输入为文件夹时只处理第一层图片')
     local_parser.add_argument('--use-gpu', action='store_true', default=None,
                              help='使用 GPU 加速（覆盖配置文件）')
     local_parser.add_argument('--disable-onnx-gpu', action='store_true', default=None,

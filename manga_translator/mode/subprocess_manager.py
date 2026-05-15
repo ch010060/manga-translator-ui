@@ -116,7 +116,9 @@ def worker_translate_batch(
             'output_folder': output_dir,
             'format': output_format,
             'overwrite': overwrite,
-            'input_folders': set()
+            'input_folders': set(),
+            'save_to_source_dir': bool(cli_config.get('save_to_source_dir', False)),
+            'source_result_dir': cli_config.get('source_result_dir', 'manga_translator_work/result'),
         }
         
         # 处理图片

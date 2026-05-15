@@ -564,14 +564,15 @@ class MangaTranslator:
         input_folders = save_info.get('input_folders', set())
         output_format = save_info.get('format')
         save_to_source_dir = save_info.get('save_to_source_dir', False)
+        source_result_dir = save_info.get('source_result_dir', 'manga_translator_work/result')
         
         file_path = image_path
         parent_dir = os.path.normpath(os.path.dirname(file_path))
         
         # 检查是否启用了"输出到原图目录"模式
         if save_to_source_dir:
-            # 输出到原图所在目录的 manga_translator_work/result 子目录
-            final_output_dir = os.path.join(parent_dir, 'manga_translator_work', 'result')
+            # 输出到原图所在目录下的指定结果子目录
+            final_output_dir = os.path.join(parent_dir, source_result_dir)
         else:
             # 原有逻辑：使用配置的输出目录
             final_output_dir = output_folder

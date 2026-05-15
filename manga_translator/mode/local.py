@@ -55,12 +55,20 @@ def parse_args():
                         help='输入图片或文件夹路径')
     parser.add_argument('-o', '--output', default=None,
                         help='输出目录（默认：同目录加 -translated 后缀）')
+    parser.add_argument('--save-to-source-dir', action='store_true',
+                        help='输出到每张原图所在目录下的结果子目录')
+    parser.add_argument('--source-result-dir', default='manga_translator_work/result',
+                        help='配合 --save-to-source-dir 使用的结果子目录（默认：manga_translator_work/result）')
     parser.add_argument('--config', default=None,
                         help='配置文件路径（默认：examples/config.json）')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='显示详细日志')
     parser.add_argument('--overwrite', action='store_true',
                         help='覆盖已存在的文件')
+    parser.add_argument('--no-overwrite', action='store_true',
+                        help='不覆盖已存在的输出文件（覆盖配置文件中的 overwrite）')
+    parser.add_argument('--no-recursive', action='store_true',
+                        help='输入为文件夹时只处理第一层图片')
     
     # 内存管理参数
     parser.add_argument('--subprocess', action='store_true',
@@ -199,6 +207,9 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
     # overwrite: 命令行参数优先，否则使用配置文件
     if overwrite:
         cli_config['overwrite'] = True
+    elif getattr(args, 'no_overwrite', False):
+        cli_config['overwrite'] = False
+        overwrite = False
     else:
         overwrite = cli_config.get('overwrite', False)
     
@@ -303,9 +314,10 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
     folders.sort(key=file_service._natural_sort_key)
     
     # 按文件夹分组处理
+    recursive = not bool(getattr(args, 'no_recursive', False))
     for folder in folders:
         # 递归获取文件夹中的所有图片（已经使用自然排序）
-        folder_files = file_service.get_image_files_from_folder(folder, recursive=True)
+        folder_files = file_service.get_image_files_from_folder(folder, recursive=recursive)
         all_files.extend(folder_files)
     
     # 处理单独添加的文件（使用自然排序）
@@ -403,7 +415,9 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
         'output_folder': final_output_dir,
         'format': output_format,
         'overwrite': overwrite,
-        'input_folders': input_folders  # 保持为 set，翻译器内部会处理
+        'input_folders': input_folders,  # 保持为 set，翻译器内部会处理
+        'save_to_source_dir': bool(getattr(args, 'save_to_source_dir', False)),
+        'source_result_dir': getattr(args, 'source_result_dir', 'manga_translator_work/result'),
     }
     
     # 调试：检查输出目录是否存在
@@ -640,6 +654,8 @@ async def run_local_mode(args):
     use_subprocess = getattr(args, 'subprocess', False)
     verbose = getattr(args, 'verbose', False)
     overwrite = getattr(args, 'overwrite', False)
+    if getattr(args, 'no_overwrite', False):
+        overwrite = False
     
     if use_subprocess:
         # 子进程模式
@@ -661,8 +677,9 @@ async def run_local_mode(args):
                 folders.append(input_path)
         
         folders.sort(key=file_service._natural_sort_key)
+        recursive = not bool(getattr(args, 'no_recursive', False))
         for folder in folders:
-            folder_files = file_service.get_image_files_from_folder(folder, recursive=True)
+            folder_files = file_service.get_image_files_from_folder(folder, recursive=recursive)
             all_files.extend(folder_files)
         
         individual_files.sort(key=file_service._natural_sort_key)
@@ -707,7 +724,9 @@ async def run_local_mode(args):
                     'output_folder': output_dir,
                     'format': output_format,
                     'overwrite': overwrite,
-                    'input_folders': set()
+                    'input_folders': set(),
+                    'save_to_source_dir': bool(getattr(args, 'save_to_source_dir', False)),
+                    'source_result_dir': getattr(args, 'source_result_dir', 'manga_translator_work/result'),
                 }
                 
                 temp_translator = MangaTranslator(params=cli_config)
@@ -758,6 +777,8 @@ async def run_local_mode(args):
                 cli_config['use_gpu'] = args.use_gpu
             if hasattr(args, 'disable_onnx_gpu') and args.disable_onnx_gpu is not None:
                 cli_config['disable_onnx_gpu'] = args.disable_onnx_gpu
+            cli_config['save_to_source_dir'] = bool(getattr(args, 'save_to_source_dir', False))
+            cli_config['source_result_dir'] = getattr(args, 'source_result_dir', 'manga_translator_work/result')
             config_dict['cli'] = cli_config
             
             success_count, failed_count = await translate_with_subprocess(
