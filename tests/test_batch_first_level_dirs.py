@@ -1,4 +1,5 @@
 import sys
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -6,16 +7,20 @@ from pathlib import Path
 
 from scripts.headless_batch_by_first_level_dirs import (
     BatchOptions,
+    JobState,
     build_local_command,
     count_images,
     discover_book_dirs,
     main,
+    parse_args,
     preflight_checks,
+    run_job,
     resolve_default_config_path,
     resolve_sakura_api_base,
     is_book_complete,
     sanitize_log_name,
 )
+from manga_translator.args import create_parser
 
 
 class BatchFirstLevelDirsTests(unittest.TestCase):
@@ -95,6 +100,74 @@ class BatchFirstLevelDirsTests(unittest.TestCase):
         self.assertIn("--batch-size", command)
         self.assertIn("4", command)
 
+    def test_build_local_command_can_enable_intra_book_concurrent_pipeline(self):
+        options = BatchOptions(
+            config=Path("examples/config.json"),
+            result_dir_name="result",
+            intra_book_concurrent=True,
+        )
+
+        command = build_local_command(
+            python_executable=Path(sys.executable),
+            book_dir=Path("D:/manga/book"),
+            options=options,
+        )
+
+        self.assertIn("--concurrent", command)
+
+    def test_top_level_local_parser_accepts_concurrent_pipeline_flag(self):
+        parser = create_parser()
+
+        args = parser.parse_args(["local", "-i", "D:/manga/book", "--concurrent"])
+
+        self.assertTrue(args.concurrent)
+
+    def test_batch_parser_uses_benchmarked_fast_defaults(self):
+        args = parse_args(["--root", "D:/manga/root"])
+
+        self.assertEqual(args.concurrency, 5)
+        self.assertEqual(args.batch_size, 6)
+        self.assertTrue(args.intra_book_concurrent)
+
+    def test_batch_parser_can_disable_default_intra_book_concurrent_pipeline(self):
+        args = parse_args(["--root", "D:/manga/root", "--no-intra-book-concurrent"])
+
+        self.assertFalse(args.intra_book_concurrent)
+
+    def test_run_job_treats_complete_outputs_as_success_after_nonzero_child_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            book = root / "book"
+            result = book / "result"
+            result.mkdir(parents=True)
+            (book / "001.png").write_bytes(b"fake")
+            (result / "001.png").write_bytes(b"fake")
+            log_path = root / "job.log"
+
+            class CompletedProcess:
+                returncode = 120
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            with patch("scripts.headless_batch_by_first_level_dirs.subprocess.Popen", return_value=CompletedProcess()):
+                state = run_job(
+                    state=JobState(
+                        index=1,
+                        book_dir=book,
+                        total=1,
+                        log_path=log_path,
+                    ),
+                    python_executable=Path(sys.executable),
+                    options=BatchOptions(config=Path("examples/config.json")),
+                    timeout=None,
+                    cwd=Path.cwd(),
+                )
+
+            self.assertEqual(state.returncode, 120)
+            self.assertEqual(state.status, "pass")
+            self.assertIn("outputs are complete", log_path.read_text(encoding="utf-8"))
+
     def test_default_config_path_matches_gui_user_config(self):
         default_config = resolve_default_config_path()
 
@@ -140,10 +213,11 @@ class BatchFirstLevelDirsTests(unittest.TestCase):
             env_path = Path(tmp) / ".env"
             env_path.write_text('SAKURA_API_BASE="http://127.0.0.1:18080/v1"\n', encoding="utf-8")
 
-            self.assertEqual(
-                resolve_sakura_api_base(env_path=env_path),
-                "http://127.0.0.1:18080/v1",
-            )
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    resolve_sakura_api_base(env_path=env_path),
+                    "http://127.0.0.1:18080/v1",
+                )
 
     def test_preflight_fails_for_closed_sakura_endpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,7 +229,8 @@ class BatchFirstLevelDirsTests(unittest.TestCase):
             with patch("scripts.headless_batch_by_first_level_dirs.urlopen") as urlopen:
                 urlopen.side_effect = OSError("connection refused")
 
-                ok, message = preflight_checks(config, env_path=env_path, timeout_seconds=0.01)
+                with patch.dict(os.environ, {}, clear=True):
+                    ok, message = preflight_checks(config, env_path=env_path, timeout_seconds=0.01)
 
             self.assertFalse(ok)
             self.assertIn("Sakura API endpoint is not reachable", message)

@@ -16,15 +16,17 @@
   "mask_dilation_offset": 50,
   "use_custom_api_params": true,
   "translator": {
-    "translator": "original",
-    "target_lang": "CHT",
+    "translator": "sakura",
+    "target_lang": "CHS",
     "keep_lang": "none",
     "enable_streaming": true,
     "no_text_lang_skip": false,
     "high_quality_prompt_path": "dict/prompt_example.yaml",
     "extract_glossary": true,
     "max_requests_per_minute": 0,
-    "remove_trailing_period": true
+    "remove_trailing_period": true,
+    "convert_to_traditional": true,
+    "convert_to_simplified": false
   },
   "ocr": {
     "ocr": "48px",
@@ -67,7 +69,7 @@
   "render": {
     "renderer": "manga2eng",
     "alignment": "auto",
-    "disable_font_border": false,
+    "disable_font_border": true,
     "disable_auto_wrap": false,
     "font_size_offset": 0,
     "font_size_minimum": 0,
@@ -76,6 +78,7 @@
     "lowercase": false,
     "font_path": "fonts/Arial-Unicode-Regular.ttf",
     "no_hyphenation": false,
+    "bubble_layout_english": false,
     "font_color": null,
     "line_spacing": 1.0,
     "letter_spacing": 1.0,

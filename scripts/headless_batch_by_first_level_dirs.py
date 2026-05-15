@@ -22,6 +22,8 @@ from urllib.request import Request, urlopen
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".avif"}
 DEFAULT_SAKURA_API_BASE = "http://127.0.0.1:8080/v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONCURRENCY = 5
+DEFAULT_BATCH_SIZE = 6
 
 
 def configure_console_encoding() -> None:
@@ -45,6 +47,7 @@ class BatchOptions:
     output_format: str | None = None
     batch_size: int | None = None
     attempts: int | None = None
+    intra_book_concurrent: bool = False
     use_subprocess: bool = False
     memory_limit: int | None = None
     memory_percent: int | None = None
@@ -163,6 +166,8 @@ def build_local_command(
         command.extend(["--batch-size", str(options.batch_size)])
     if options.attempts is not None:
         command.extend(["--attempts", str(options.attempts)])
+    if options.intra_book_concurrent:
+        command.append("--concurrent")
     if options.use_subprocess:
         command.append("--subprocess")
     if options.memory_limit is not None:
@@ -323,7 +328,17 @@ def run_job(
                 text=True,
             )
             state.returncode = process.wait(timeout=timeout)
-            state.status = "pass" if state.returncode == 0 else "fail"
+            if state.returncode == 0:
+                state.status = "pass"
+            elif is_book_complete(state.book_dir, options.result_dir_name):
+                state.status = "pass"
+                state.error = f"Process exited with code {state.returncode}, but outputs are complete."
+                log_file.write(
+                    f"\nWarning: process exited with code {state.returncode}, "
+                    "but outputs are complete; marking job as pass.\n"
+                )
+            else:
+                state.status = "fail"
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
@@ -350,7 +365,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Process each first-level manga book directory with manga_translator local mode.",
     )
     parser.add_argument("--root", required=True, type=Path, help="Directory whose first-level folders are books.")
-    parser.add_argument("--concurrency", type=int, default=1, help="Number of books to process at once.")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"Number of books to process at once. Default: {DEFAULT_CONCURRENCY}.",
+    )
     parser.add_argument("--timeout", type=int, default=0, help="Per-book timeout in seconds. 0 disables timeout.")
     parser.add_argument("--config", type=Path, default=None, help="Config file passed to local mode.")
     parser.add_argument("--result-dir-name", default="result", help="Result folder name inside each book.")
@@ -363,8 +383,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--use-gpu", action="store_true", help="Pass --use-gpu to local mode.")
     parser.add_argument("--disable-onnx-gpu", action="store_true", help="Pass --disable-onnx-gpu to local mode.")
     parser.add_argument("--format", dest="output_format", default=None, help="Output format passed to local mode.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Batch size passed to local mode.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Batch size passed to local mode. Default: {DEFAULT_BATCH_SIZE}.",
+    )
     parser.add_argument("--attempts", type=int, default=None, help="Retry attempts passed to local mode.")
+    parser.add_argument(
+        "--intra-book-concurrent",
+        dest="intra_book_concurrent",
+        action="store_true",
+        default=True,
+        help="Pass --concurrent to local mode so each book uses the internal pipeline. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-intra-book-concurrent",
+        dest="intra_book_concurrent",
+        action="store_false",
+        help="Disable the default per-book internal pipeline concurrency.",
+    )
     parser.add_argument("--subprocess", dest="use_subprocess", action="store_true", help="Use local subprocess mode.")
     parser.add_argument("--memory-limit", type=int, default=None, help="Local subprocess memory limit in MB.")
     parser.add_argument("--memory-percent", type=int, default=None, help="Local subprocess memory percent.")
@@ -396,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         output_format=args.output_format,
         batch_size=args.batch_size,
         attempts=args.attempts,
+        intra_book_concurrent=args.intra_book_concurrent,
         use_subprocess=args.use_subprocess,
         memory_limit=args.memory_limit,
         memory_percent=args.memory_percent,
