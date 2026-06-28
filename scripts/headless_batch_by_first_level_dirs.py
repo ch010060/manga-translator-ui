@@ -22,8 +22,13 @@ from urllib.request import Request, urlopen
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".avif"}
 DEFAULT_SAKURA_API_BASE = "http://127.0.0.1:8080/v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONCURRENCY = 5
-DEFAULT_BATCH_SIZE = 6
+DEFAULT_CONCURRENCY = 5        # fills SakuraLLM n=8 slots; each book emits 1 serial request
+DEFAULT_BATCH_SIZE = 4
+DEFAULT_ATTEMPTS = 2
+DEFAULT_MEMORY_PERCENT = 85    # raised from 80 so concurrency=5 doesn't trip early exits
+DEFAULT_MEMORY_LIMIT = 0
+DEFAULT_BATCH_PER_RESTART = 0  # 0=never restart mid-book; restarts silently stall progress
+COMPLETION_STABILITY_SECONDS = 8.0   # shortened from 30 so finished books are reaped fast
 
 
 def configure_console_encoding() -> None:
@@ -315,10 +320,12 @@ def run_job(
     state.status = "running"
     state.started_at = time.monotonic()
     command = build_local_command(python_executable, state.book_dir, options)
+    result_dir = result_dir_for(state.book_dir, state.result_dir_name)
 
     with state.log_path.open("w", encoding="utf-8", errors="replace") as log_file:
         log_file.write("Command: " + subprocess.list2cmdline(command) + "\n\n")
         log_file.flush()
+        complete_stable_since: float | None = None
         try:
             process = subprocess.Popen(
                 command,
@@ -327,18 +334,44 @@ def run_job(
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            state.returncode = process.wait(timeout=timeout)
-            if state.returncode == 0:
-                state.status = "pass"
-            elif is_book_complete(state.book_dir, options.result_dir_name):
-                state.status = "pass"
-                state.error = f"Process exited with code {state.returncode}, but outputs are complete."
-                log_file.write(
-                    f"\nWarning: process exited with code {state.returncode}, "
-                    "but outputs are complete; marking job as pass.\n"
-                )
-            else:
-                state.status = "fail"
+            while True:
+                try:
+                    state.returncode = process.wait(timeout=1.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    if timeout is not None and (time.monotonic() - state.started_at) >= timeout:
+                        raise
+
+                    finished = count_images(result_dir)
+                    if state.total and finished >= state.total:
+                        if complete_stable_since is None:
+                            complete_stable_since = time.monotonic()
+                        elif (time.monotonic() - complete_stable_since) >= COMPLETION_STABILITY_SECONDS:
+                            process.kill()
+                            state.returncode = process.wait()
+                            state.status = "pass"
+                            state.error = (
+                                f"All {state.total} outputs were present for "
+                                f"{COMPLETION_STABILITY_SECONDS:.0f}s; marking as pass."
+                            )
+                            log_file.write(f"\nWarning: {state.error}\n")
+                            break
+                    else:
+                        complete_stable_since = None
+                    continue
+
+            if state.status == "running":
+                if state.returncode == 0:
+                    state.status = "pass"
+                elif is_book_complete(state.book_dir, options.result_dir_name):
+                    state.status = "pass"
+                    state.error = f"Process exited with code {state.returncode}, but outputs are complete."
+                    log_file.write(
+                        f"\nWarning: process exited with code {state.returncode}, "
+                        "but outputs are complete; marking job as pass.\n"
+                    )
+                else:
+                    state.status = "fail"
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
@@ -389,24 +422,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_BATCH_SIZE,
         help=f"Batch size passed to local mode. Default: {DEFAULT_BATCH_SIZE}.",
     )
-    parser.add_argument("--attempts", type=int, default=None, help="Retry attempts passed to local mode.")
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=DEFAULT_ATTEMPTS,
+        help=f"Retry attempts passed to local mode. Default: {DEFAULT_ATTEMPTS}.",
+    )
     parser.add_argument(
         "--intra-book-concurrent",
         dest="intra_book_concurrent",
         action="store_true",
-        default=True,
-        help="Pass --concurrent to local mode so each book uses the internal pipeline. Enabled by default.",
+        default=False,
+        help="Pass --concurrent to local mode so each book uses the internal pipeline. Disabled by default.",
     )
     parser.add_argument(
         "--no-intra-book-concurrent",
         dest="intra_book_concurrent",
         action="store_false",
-        help="Disable the default per-book internal pipeline concurrency.",
+        help="Disable per-book internal pipeline concurrency.",
     )
-    parser.add_argument("--subprocess", dest="use_subprocess", action="store_true", help="Use local subprocess mode.")
-    parser.add_argument("--memory-limit", type=int, default=None, help="Local subprocess memory limit in MB.")
-    parser.add_argument("--memory-percent", type=int, default=None, help="Local subprocess memory percent.")
-    parser.add_argument("--batch-per-restart", type=int, default=None, help="Local subprocess restart interval.")
+    parser.add_argument(
+        "--subprocess",
+        dest="use_subprocess",
+        action="store_true",
+        default=True,
+        help=f"Use local subprocess mode. Default: enabled.",
+    )
+    parser.add_argument(
+        "--memory-limit",
+        type=int,
+        default=DEFAULT_MEMORY_LIMIT,
+        help=f"Local subprocess memory limit in MB. Default: {DEFAULT_MEMORY_LIMIT}.",
+    )
+    parser.add_argument(
+        "--memory-percent",
+        type=int,
+        default=DEFAULT_MEMORY_PERCENT,
+        help=f"Local subprocess memory percent. Default: {DEFAULT_MEMORY_PERCENT}.",
+    )
+    parser.add_argument(
+        "--batch-per-restart",
+        type=int,
+        default=DEFAULT_BATCH_PER_RESTART,
+        help=f"Local subprocess restart interval. Default: {DEFAULT_BATCH_PER_RESTART}.",
+    )
     parser.add_argument("local_args", nargs=argparse.REMAINDER, help="Extra args after -- are passed to local mode.")
     return parser.parse_args(argv)
 
