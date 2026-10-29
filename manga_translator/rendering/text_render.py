@@ -257,7 +257,11 @@ def _ensure_qt_runtime():
     with _qt_runtime_lock:
         app = QGuiApplication.instance()
         if app is None:
-            os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+            # On Windows the offscreen backend can return an unusable fallback
+            # QRawFont for missing glyphs (access violation in familyName()).
+            # The native backend resolves these fonts without creating a window.
+            # Keep explicit platform overrides and headless Unix behavior.
+            os.environ.setdefault('QT_QPA_PLATFORM', 'windows' if os.name == 'nt' else 'offscreen')
             _bootstrap_qt_fontdir_for_offscreen()
             _qt_runtime_app = QGuiApplication([])
             return _qt_runtime_app

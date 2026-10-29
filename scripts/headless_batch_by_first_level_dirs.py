@@ -316,6 +316,7 @@ def run_job(
     options: BatchOptions,
     timeout: int | None,
     cwd: Path,
+    stall_timeout: int = 600,
 ) -> JobState:
     state.status = "running"
     state.started_at = time.monotonic()
@@ -326,6 +327,9 @@ def run_job(
         log_file.write("Command: " + subprocess.list2cmdline(command) + "\n\n")
         log_file.flush()
         complete_stable_since: float | None = None
+        last_finished = count_images(result_dir)
+        last_progress_at = time.monotonic()
+        timeout_reason: str | None = None
         try:
             process = subprocess.Popen(
                 command,
@@ -340,9 +344,23 @@ def run_job(
                     break
                 except subprocess.TimeoutExpired:
                     if timeout is not None and (time.monotonic() - state.started_at) >= timeout:
+                        timeout_reason = f"Timed out after {timeout} seconds"
                         raise
 
                     finished = count_images(result_dir)
+                    if finished > last_finished:
+                        last_progress_at = time.monotonic()
+                    last_finished = finished
+                    if (
+                        stall_timeout > 0
+                        and finished < state.total
+                        and time.monotonic() - last_progress_at >= stall_timeout
+                    ):
+                        timeout_reason = (
+                            f"No new outputs for {stall_timeout} seconds "
+                            f"({finished}/{state.total} pages). See preceding log entries."
+                        )
+                        raise
                     if state.total and finished >= state.total:
                         if complete_stable_since is None:
                             complete_stable_since = time.monotonic()
@@ -373,12 +391,23 @@ def run_job(
                 else:
                     state.status = "fail"
         except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        timeout=15,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    log_file.write(f"\nProcess-tree cleanup warning: {exc}\n")
             process.kill()
             process.wait()
             state.returncode = process.returncode
             state.status = "timeout"
-            state.error = f"Timed out after {timeout} seconds"
-            log_file.write(f"\nTimed out after {timeout} seconds\n")
+            state.error = timeout_reason or f"Timed out after {timeout} seconds"
+            log_file.write(f"\n{state.error}\n")
         except Exception as exc:
             state.status = "fail"
             state.error = str(exc)
@@ -405,6 +434,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Number of books to process at once. Default: {DEFAULT_CONCURRENCY}.",
     )
     parser.add_argument("--timeout", type=int, default=0, help="Per-book timeout in seconds. 0 disables timeout.")
+    parser.add_argument(
+        "--stall-timeout", type=int, default=600,
+        help="Timeout when no new output images appear, in seconds. Default: 600. 0 disables it.",
+    )
     parser.add_argument("--config", type=Path, default=None, help="Config file passed to local mode.")
     parser.add_argument("--result-dir-name", default="result", help="Result folder name inside each book.")
     parser.add_argument("--logs-dir", type=Path, default=Path("result") / "batch_logs", help="Directory for per-book logs.")
@@ -545,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
-            executor.submit(run_job, state, Path(sys.executable), options, timeout, PROJECT_ROOT): state
+            executor.submit(run_job, state, Path(sys.executable), options, timeout, PROJECT_ROOT, args.stall_timeout): state
             for state in pending
         }
         while futures:
