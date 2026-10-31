@@ -240,6 +240,7 @@ scripts/
 !scripts/
 scripts/*
 !scripts/headless_batch_by_first_level_dirs.py
+!scripts/batch_job_runtime.py
 
 # CatieCli directory (克隆的外部仓库)
 CatieCli/

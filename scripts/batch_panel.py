@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
 import json
 import os
 import sys
 import time
+import uuid
+from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from PyQt6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, Qt, QThread, pyqtSignal, QSize, QEvent
+from PyQt6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, Qt, QThread, pyqtSignal, QSize, QEvent, QObject
 from PyQt6.QtGui import QDesktopServices, QFont, QColor, QIcon, QPixmap, QPainter
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -20,6 +25,18 @@ from PyQt6.QtWidgets import (
 )
 
 import headless_batch_by_first_level_dirs as batch
+from batch_job_runtime import WindowsJob, expected_outputs, output_snapshot, validate_outputs
+
+
+# QSpinBox is signed 32-bit. Use the full safe positive range rather than
+# arbitrary workload caps; attempts=-1 is the documented unlimited sentinel.
+BATCH_RANGES = {
+    'concurrency': (1, 2147483647), 'batch_size': (1, 2147483647),
+    'stall_timeout': (0, 2147483647), 'attempts': (-1, 2147483647),
+    'timeout': (0, 2147483647), 'memory_limit': (0, 2147483647),
+    'memory_percent': (0, 100), 'batch_per_restart': (0, 2147483647),
+}
+BATCH_FLAGS = ('intra_book_concurrent', 'use_subprocess', 'force')
 
 
 STYLE = """
@@ -154,35 +171,150 @@ def decorate_buttons(parent):
             button.setIconSize(QSize(18, 18))
 
 
+class ProcessCleanup(QObject):
+    """Bounded asynchronous cleanup; success requires kernel/direct exit evidence."""
+    done = pyqtSignal(bool, str)
+    COMMAND_MS = 3000
+    VERIFY_MS = 3000
+
+    @staticmethod
+    def command_for(pid):
+        return ['taskkill', '/PID', str(pid), '/T', '/F']
+
+    def __init__(self, process, guard, parent=None):
+        super().__init__(parent)
+        self.process, self.guard = process, guard
+        self.notes = []
+        self.completed = False
+        self.fallback_started = False
+        self.command = QProcess(self)
+        self.deadline = QTimer(self)
+        self.deadline.setSingleShot(True)
+        self.deadline.timeout.connect(self.command_timeout)
+        self.poll = QTimer(self)
+        self.poll.setInterval(50)
+        self.poll.timeout.connect(self.verify)
+        self.command.finished.connect(self.command_finished)
+        self.command.errorOccurred.connect(self.command_error)
+
+    def start(self):
+        pid = self.process.processId()
+        if os.name == 'nt' and pid:
+            self.deadline.start(self.COMMAND_MS)
+            command = self.command_for(pid)
+            self.command.start(command[0], command[1:])
+        else:
+            self.fallback('Direct process already exited or no Windows taskkill needed')
+
+    def command_error(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.fallback('taskkill FailedToStart: ' + self.command.errorString())
+
+    def command_timeout(self):
+        self.command.kill()
+        self.fallback('taskkill timed out')
+
+    def command_finished(self, code, status):
+        self.fallback(f'taskkill exit={code}, status={status.name}')
+
+    def fallback(self, note):
+        if self.completed or self.fallback_started:
+            return
+        self.fallback_started = True
+        self.deadline.stop()
+        self.notes.append(note)
+        try:
+            if self.guard is not None:
+                if self.guard.active_count():
+                    self.guard.terminate()
+                    self.notes.append('TerminateJobObject issued; awaiting active_count=0')
+            elif os.name == 'nt' and self.process.state() != QProcess.ProcessState.NotRunning:
+                self.notes.append('No Windows containment handle: descendants cannot be verified')
+            if self.process.state() != QProcess.ProcessState.NotRunning:
+                self.process.kill()
+        except Exception as exc:
+            self.notes.append(f'Cleanup fallback error: {exc}')
+        self.verify_until = time.monotonic() + self.VERIFY_MS / 1000
+        self.poll.start()
+        self.verify()
+
+    def verify(self):
+        if self.completed:
+            return
+        try:
+            direct_gone = self.process.state() == QProcess.ProcessState.NotRunning
+            tree_gone = self.guard.active_count() == 0 if self.guard is not None else os.name != 'nt'
+            if direct_gone and tree_gone:
+                self.finish(True, 'Verified direct process and contained descendants exited')
+                return
+        except Exception as exc:
+            self.notes.append(f'Cleanup verification error: {exc}')
+            self.finish(False, 'Unable to verify process-tree termination')
+            return
+        if time.monotonic() >= self.verify_until:
+            self.finish(False, 'Cleanup deadline exceeded; termination NOT confirmed')
+
+    def finish(self, ok, note):
+        if self.completed:
+            return
+        self.completed = True
+        self.poll.stop()
+        self.deadline.stop()
+        self.notes.append(note)
+        self.done.emit(ok, '; '.join(self.notes))
+
+
+class Lifecycle(Enum):
+    IDLE = auto()
+    PREFLIGHT = auto()
+    RUNNING = auto()
+    STOPPING = auto()
+    FINISHED = auto()
+
+
+@dataclass(frozen=True)
+class BackendRequest:
+    generation: int
+    identity: tuple
+    config: Path
+    endpoint: str
+    content: bytes
+
+
 class BackendCheck(QThread):
     result = pyqtSignal(bool, str, str)
 
-    def __init__(self, config, parent=None):
+    def __init__(self, request, parent=None):
         super().__init__(parent)
-        self.config = config
+        self.request = request
 
     def run(self):
         try:
-            if not self.config.is_file():
-                raise ValueError('設定檔不存在')
-            data = batch.load_config_dict(self.config)
+            data = json.loads(self.request.content)
             translator = str((data.get('translator') or {}).get('translator', '')).lower()
             if translator != 'sakura':
                 self.result.emit(False, f'目前連線檢查僅支援 Sakura，設定使用 {translator or "未指定"}；請選用 Sakura 設定檔。', '')
                 return
-            ok, message = batch.preflight_checks(self.config)
+            # One request replaces the previous preflight + duplicate /models
+            # fetch. Retain the CLI preflight's 4xx-reachable compatibility;
+            # neither reachability nor a model list is an inference guarantee.
+            url = self.request.endpoint + '/models'
+            request = Request(url, headers={'Authorization': 'Bearer sk-114514'})
             models = ''
-            if ok:
-                try:
-                    request = Request(batch.resolve_sakura_api_base() + '/models',
-                                      headers={'Authorization': 'Bearer sk-114514'})
-                    with urlopen(request, timeout=3) as response:
+            try:
+                with urlopen(request, timeout=3) as response:
+                    message = f'Sakura API endpoint reachable: {url}'
+                    try:
                         payload = json.load(response)
-                    models = ', '.join(str(item['id']) for item in payload.get('data', [])
-                                       if isinstance(item, dict) and item.get('id'))
-                except Exception as exc:
-                    message += f'\n無法取得模型清單：{exc}'
-            self.result.emit(ok, message, models)
+                        models = ', '.join(str(item['id']) for item in payload.get('data', [])
+                                           if isinstance(item, dict) and item.get('id'))
+                    except Exception as exc:
+                        message += f'\n無法取得模型清單：{exc}'
+            except HTTPError as exc:
+                if not 400 <= exc.code < 500:
+                    raise
+                message = f'Sakura API endpoint reachable: {url} (HTTP {exc.code}; 未驗證推論授權)'
+            self.result.emit(True, message, models)
         except Exception as exc:
             self.result.emit(False, str(exc), '')
 
@@ -255,6 +387,17 @@ class Panel(QMainWindow):
         self.backend_ok = False
         self.backend_worker = None
         self.pending_start = False
+        self.pending_identity = None
+        self.pending_selection = None
+        self.lifecycle = Lifecycle.IDLE
+        self.closing = False
+        self.backend_generation = 0
+        self.backend_request = None
+        self.queued_check = None
+        self.backend_identity = None
+        self.backend_reply = None
+        self.run_generation = 0
+        self.run_jobs = ()
         self.scanned_root = None
         self.jobs = []
         self.running = False
@@ -291,10 +434,11 @@ class Panel(QMainWindow):
         config_row.addWidget(config_button)
         form.addRow('翻譯設定', config_row)
         options = QHBoxLayout()
-        self.concurrent = self.spin(options, '同時處理', 1, 16, batch.DEFAULT_CONCURRENCY)
-        self.batch_size = self.spin(options, '批次大小', 1, 64, batch.DEFAULT_BATCH_SIZE)
-        self.stall = self.spin(options, '停滯上限（秒，0 關閉）', 0, 86400, 600)
+        self.concurrent = self.spin(options, '同時處理', *BATCH_RANGES['concurrency'], self.defaults['concurrency'])
+        self.batch_size = self.spin(options, '批次大小', *BATCH_RANGES['batch_size'], self.defaults['batch_size'])
+        self.stall = self.spin(options, '停滯上限（秒，0 關閉）', *BATCH_RANGES['stall_timeout'], self.defaults['stall_timeout'])
         self.force = QCheckBox('覆寫既有輸出')
+        self.force.setChecked(self.defaults['force'])
         self.force.setParent(self)
         self.force.hide()
         options.addStretch()
@@ -415,25 +559,71 @@ class Panel(QMainWindow):
         for widget in [self, *self.findChildren(QWidget)]:
             widget.setMouseTracking(True)
             widget.installEventFilter(self)
+        self.sync_ui()
 
-    def clear_tasks(self):
-        if self.running or self.pending_start or any(job['process'] is not None for job in self.jobs):
-            return
+    def has_owned_processes(self):
+        return any(job.get('process') is not None or job.get('guard') is not None
+                   or job.get('cleanup') is not None for job in self.jobs)
+
+    def can_edit_jobs(self):
+        return (not self.closing and self.lifecycle in (Lifecycle.IDLE, Lifecycle.FINISHED)
+                and not self.pending_start and not self.has_owned_processes())
+
+    def transition(self, state):
+        legal = {
+            Lifecycle.IDLE: {Lifecycle.PREFLIGHT, Lifecycle.RUNNING},
+            Lifecycle.PREFLIGHT: {Lifecycle.IDLE, Lifecycle.FINISHED, Lifecycle.RUNNING},
+            Lifecycle.RUNNING: {Lifecycle.STOPPING, Lifecycle.FINISHED},
+            Lifecycle.STOPPING: {Lifecycle.FINISHED},
+            Lifecycle.FINISHED: {Lifecycle.IDLE, Lifecycle.PREFLIGHT, Lifecycle.RUNNING},
+        }
+        if state != self.lifecycle and state not in legal[self.lifecycle]:
+            raise RuntimeError(f'Illegal lifecycle transition: {self.lifecycle.name} -> {state.name}')
+        self.lifecycle = state
+        self.running = state == Lifecycle.RUNNING  # Compatibility for existing P0 callbacks/tests.
+        self.sync_ui()
+
+    def sync_ui(self):
+        editable = self.can_edit_jobs()
+        checking = self.backend_worker is not None or self.queued_check is not None
+        self.controls.setEnabled(editable)
+        self.batch_settings_button.setEnabled(editable)
+        self.scan_button.setEnabled(editable)
+        self.clear_button.setEnabled(editable)
+        self.start_button.setEnabled(editable and (self.backend_ok or checking))
+        self.stop_button.setEnabled(self.has_owned_processes() and
+                                    any(j.get('process') is not None and j.get('cleanup') is None for j in self.jobs))
+        self.retry_backend.setEnabled(editable and not checking)
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None:
+                flags = item.flags()
+                item.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable if editable
+                              else flags & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+    def reset_summary(self):
         if hasattr(self, 'completion_box'):
             self.completion_box.close()
+        self.run_jobs = ()
+        self.started = 0.0
+        self.ended = None
+        self.batch_stopped = False
+        self.stats.setStyleSheet('')
+        self.overall.setRange(0, 100)
+        self.overall.setValue(0)
+        self.overall.setFormat('等待開始')
+
+    def clear_tasks(self):
+        if not self.can_edit_jobs():
+            return
+        self.reset_summary()
         self.jobs.clear()
         self.table.setRowCount(0)
         self.log.clear()
         self.search.clear()
-        self.started = 0.0
-        self.ended = None
-        self.batch_stopped = False
         self.scanned_root = None
-        self.stats.setStyleSheet('')
         self.stats.setText('任務已清空')
-        self.overall.setRange(0, 100)
-        self.overall.setValue(0)
-        self.overall.setFormat('等待開始')
+        self.transition(Lifecycle.IDLE)
 
     def toggle_log(self, visible):
         self.log.setVisible(visible)
@@ -484,37 +674,94 @@ class Panel(QMainWindow):
         for row, job in enumerate(self.jobs):
             self.table.setRowHidden(row, query not in job['book'].name.casefold())
 
+    def config_identity(self):
+        config = Path(self.config.text()).expanduser().resolve()
+        try:
+            content = config.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+        except OSError as exc:
+            content, digest = b'', str(exc)
+        endpoint = batch.resolve_sakura_api_base()
+        return (str(config), digest, endpoint), config, content, endpoint
+
+    def new_check(self, identity_data):
+        identity, config, content, endpoint = identity_data
+        self.backend_generation += 1
+        request = BackendRequest(self.backend_generation, identity, config, endpoint, content)
+        self.queued_check = request
+        return request
+
+    def cancel_pending_start(self):
+        self.pending_start = False
+        self.pending_identity = None
+        self.pending_selection = None
+        if self.lifecycle == Lifecycle.PREFLIGHT:
+            self.transition(Lifecycle.FINISHED if self.ended is not None else Lifecycle.IDLE)
+
     def config_changed(self):
+        if self.closing:
+            return
+        self.cancel_pending_start()
         self.backend_ok = False
-        self.start_button.setEnabled(False)
+        self.backend_identity = None
+        self.new_check(self.config_identity())
         self.backend_status.setText('設定已變更，等待重新檢查…')
         self.backend_status.setStyleSheet('color:#b8c8dd;border:0;padding:0;')
-        self.check_delay.start()
+        if self.backend_worker is None and not self.has_owned_processes():
+            self.check_delay.start()
+        self.sync_ui()
 
     def check_backend(self, launch=False):
-        if self.backend_worker is not None:
+        if self.closing or self.lifecycle in (Lifecycle.RUNNING, Lifecycle.STOPPING) or self.has_owned_processes():
             return
-        self.check_delay.stop()
-        self.pending_start = launch
+        data = self.config_identity()
+        identity = data[0]
         if launch:
-            self.clear_button.setEnabled(False)
+            if self.pending_start:
+                return  # Repeated Start is the same intent, never another batch.
+            self.pending_start = True
+            self.pending_identity = identity
+            self.pending_selection = tuple(self.jobs[row] for row in range(len(self.jobs))
+                                           if self.table.item(row, 0).checkState() == Qt.CheckState.Checked)
+            self.transition(Lifecycle.PREFLIGHT)
+        request = self.queued_check
+        if request is None or request.identity != identity:
+            current = self.backend_request
+            if (self.backend_worker is not None and current is not None
+                    and current.generation == self.backend_generation and current.identity == identity):
+                self.sync_ui()
+                return  # An explicit Start can attach to this in-flight check.
+            request = self.new_check(data)
+        self.check_delay.stop()
         self.backend_ok = False
-        self.start_button.setEnabled(False)
-        self.retry_backend.setEnabled(False)
+        self.backend_identity = None
         self.backend_status.setText('正在連接翻譯後端…')
         self.backend_status.setStyleSheet('color:#b8c8dd;border:0;padding:0;')
-        config = Path(self.config.text()).expanduser().resolve()
-        worker = BackendCheck(config, self)
-        self.backend_worker = worker
-        worker.result.connect(lambda ok, message, models: self.backend_result(config, ok, message, models))
-        worker.finished.connect(self.backend_finished)
-        worker.start()
+        if self.backend_worker is None:
+            self.queued_check = None
+            self.backend_request = request
+            self.backend_reply = None
+            worker = BackendCheck(request, self)
+            self.backend_worker = worker
+            worker.result.connect(lambda ok, message, models, r=request:
+                                  self.backend_result(r, ok, message, models))
+            worker.finished.connect(lambda r=request, w=worker: self.backend_finished(r, w))
+            worker.start()
+        self.sync_ui()
 
-    def backend_result(self, config, ok, message, models=''):
-        if config != Path(self.config.text()).expanduser().resolve():
-            self.pending_start = False
-            self.check_delay.start()
+    def applicable_check(self, request):
+        return (not self.closing and request is self.backend_request
+                and request.generation == self.backend_generation
+                and request.identity == self.config_identity()[0]
+                and self.lifecycle not in (Lifecycle.RUNNING, Lifecycle.STOPPING)
+                and not self.has_owned_processes())
+
+    def backend_result(self, request, ok, message, models=''):
+        if not self.applicable_check(request):
             return
+        self.backend_reply = (ok, message, models)
+
+    def display_backend_result(self, ok, message, models):
         self.backend_ok = ok
         self.retry_backend.setVisible(not ok)
         summary = ('已連線  |  模型：' + (models or '未取得模型資訊')) if ok else '後端離線  |  模型：不可用'
@@ -524,21 +771,35 @@ class Panel(QMainWindow):
                                        '\n模型名稱為後端回報的可用模型，不代表已完成推論驗證。')
         self.backend_status.setStyleSheet(
             'border:0;padding:0;color:' + ('#86dfac;' if ok else '#ff8e97;'))
-        launch = self.pending_start
-        self.pending_start = False
-        if launch and not ok:
-            QMessageBox.warning(self, '無法開始翻譯', message + '\n\n請啟動後端服務後按「重新檢查」。')
-        elif launch:
-            self.begin_translation()
-
-    def backend_finished(self):
-        self.backend_worker.deleteLater()
+    def backend_finished(self, request, worker):
+        if self.backend_worker is not worker:
+            return
         self.backend_worker = None
-        self.retry_backend.setEnabled(True)
-        self.start_button.setEnabled(self.backend_ok and not self.running and
-                                     not any(j['process'] is not None for j in self.jobs))
-        self.clear_button.setEnabled(not self.running and not self.pending_start and
-                                     not any(j['process'] is not None for j in self.jobs))
+        worker.deleteLater()
+        if self.closing:
+            QTimer.singleShot(0, self.close)
+            return
+        if request.identity != self.config_identity()[0] and request.generation == self.backend_generation:
+            self.config_changed()  # Same-path edits or endpoint changes without a textChanged signal.
+        if self.queued_check is not None:
+            self.check_backend()
+            return
+        if not self.applicable_check(request):
+            self.sync_ui()
+            return
+        # A thread finishing without a result is not success. Fail closed rather
+        # than reusing a previous reply; covered by the missing-reply regression.
+        ok, message, models = self.backend_reply or (False, '後端檢查未回傳結果', '')
+        self.backend_identity = request.identity
+        self.display_backend_result(ok, message, models)
+        launch = self.pending_start and self.pending_identity == request.identity
+        if launch and ok:
+            self.begin_translation(approved=request)
+        else:
+            self.cancel_pending_start()
+            if launch:
+                QMessageBox.warning(self, '無法開始翻譯', message + '\n\n請啟動後端服務後按「重新檢查」。')
+        self.sync_ui()
 
     def pause_follow(self):
         self.follow = False
@@ -578,44 +839,74 @@ class Panel(QMainWindow):
             for key in ('follow', 'auto_scan', 'notify', 'log_follow'):
                 self.settings.setValue(key, getattr(self, key))
 
+    def batch_settings_snapshot(self):
+        return dict(self.advanced, concurrency=self.concurrent.value(), batch_size=self.batch_size.value(),
+                    stall_timeout=self.stall.value(), force=self.force.isChecked())
+
+    def default_batch_settings(self):
+        return {key: self.defaults[key] for key in (*BATCH_RANGES, *BATCH_FLAGS)}
+
+    def apply_batch_settings(self, draft):
+        # The nested dialog event loop can process lifecycle changes. Recheck
+        # ownership at commit time, not only when the dialog was opened.
+        if not self.can_edit_jobs():
+            return
+        for key, (minimum, maximum) in BATCH_RANGES.items():
+            if type(draft[key]) is not int or not minimum <= draft[key] <= maximum:
+                raise ValueError(f'{key} must be between {minimum} and {maximum}')
+        if any(type(draft[key]) is not bool for key in BATCH_FLAGS):
+            raise ValueError('Batch flags must be boolean')
+        self.advanced = {key: draft[key] for key in self.advanced}
+        self.concurrent.setValue(draft['concurrency'])
+        self.batch_size.setValue(draft['batch_size'])
+        self.stall.setValue(draft['stall_timeout'])
+        self.force.setChecked(draft['force'])
+
     def batch_settings(self):
+        if not self.can_edit_jobs():
+            return
+        draft = self.batch_settings_snapshot()
         dialog = QDialog(self)
+        dialog.setObjectName('batch_settings_dialog')
         dialog.setWindowTitle('批次設定')
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel('常用設定保留於主畫面；以下為進階參數。'))
         form = QFormLayout()
         widgets = {}
-        for key, label, maximum in (
-            ('attempts', '重試次數', 100), ('timeout', '單本總逾時（秒，0 關閉）', 604800),
-            ('memory_limit', '固定記憶體限制（MB，0 關閉）', 1048576),
-            ('memory_percent', '記憶體比例限制（%）', 100),
-            ('batch_per_restart', '每隔幾批重啟（0 關閉）', 10000),
+        for key, label in (
+            ('attempts', '重試次數（-1 無限重試）'), ('timeout', '單本總逾時（秒，0 關閉）'),
+            ('memory_limit', '固定記憶體限制（MB，0 關閉）'),
+            ('memory_percent', '記憶體比例限制（%，0 關閉）'),
+            ('batch_per_restart', '每隔幾批重啟（0 關閉）'),
         ):
             widget = QSpinBox()
-            widget.setRange(0, maximum)
-            widget.setValue(self.advanced[key])
+            widget.setObjectName(key)
+            widget.setRange(*BATCH_RANGES[key])
+            widget.setValue(draft[key])
             widgets[key] = widget
             form.addRow(label, widget)
         for key, label in (('intra_book_concurrent', '書內並行'), ('use_subprocess', '子程序模式')):
             widget = QCheckBox()
-            widget.setChecked(self.advanced[key])
+            widget.setObjectName(key)
+            widget.setChecked(draft[key])
             widgets[key] = widget
             form.addRow(label, widget)
         layout.addLayout(form)
         overwrite = QCheckBox('覆寫既有輸出（關閉時跳過已存在的圖片）')
-        overwrite.setChecked(self.force.isChecked())
+        overwrite.setObjectName('force')
+        overwrite.setChecked(draft['force'])
         layout.addWidget(overwrite)
         reset = QPushButton('還原腳本預設（包含主畫面參數）')
+        reset.setObjectName('reset_batch_defaults')
         layout.addWidget(reset)
-        restore = [False]
         def reset_values():
-            restore[0] = True
-            overwrite.setChecked(self.defaults['force'])
+            draft.update(self.default_batch_settings())
+            overwrite.setChecked(draft['force'])
             for key, widget in widgets.items():
                 if isinstance(widget, QCheckBox):
-                    widget.setChecked(self.defaults[key])
+                    widget.setChecked(draft[key])
                 else:
-                    widget.setValue(self.defaults[key])
+                    widget.setValue(draft[key])
         reset.clicked.connect(reset_values)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -623,14 +914,10 @@ class Panel(QMainWindow):
         layout.addWidget(buttons)
         decorate_buttons(dialog)
         if dialog.exec():
-            self.force.setChecked(overwrite.isChecked())
-            self.advanced = {key: widget.isChecked() if isinstance(widget, QCheckBox) else widget.value()
-                             for key, widget in widgets.items()}
-            if restore[0]:
-                self.config.setText(str(batch.resolve_default_config_path()))
-                for key, widget in (('concurrency', self.concurrent), ('batch_size', self.batch_size),
-                                    ('stall_timeout', self.stall)):
-                    widget.setValue(self.defaults[key])
+            draft.update({key: widget.isChecked() if isinstance(widget, QCheckBox) else widget.value()
+                          for key, widget in widgets.items()})
+            draft['force'] = overwrite.isChecked()
+            self.apply_batch_settings(draft)
 
     @staticmethod
     def spin(row, label, minimum, maximum, value):
@@ -642,29 +929,36 @@ class Panel(QMainWindow):
         return widget
 
     def choose_root(self):
+        if not self.can_edit_jobs():
+            return
         path = QFileDialog.getExistingDirectory(self, '選擇含書籍子資料夾的書庫', self.root.text())
         if path:
             self.root.setText(path)
             self.scan()
 
     def choose_config(self):
+        if not self.can_edit_jobs():
+            return
         path, _ = QFileDialog.getOpenFileName(self, '選擇設定檔', self.config.text(), 'JSON (*.json)')
         if path:
             self.config.setText(path)
 
     def scan(self):
+        if not self.can_edit_jobs():
+            return
         try:
             if not self.root.text().strip():
                 return
             books = batch.discover_book_dirs(Path(self.root.text()).expanduser())
-            self.started = 0.0
-            self.ended = None
-            self.stats.setStyleSheet('')
+            config = batch.load_config_dict(Path(self.config.text()))
+            output_format = (config.get('cli') or {}).get('format')
+            self.reset_summary()
             self.jobs = []
             self.table.setRowCount(0)
             for book in books:
                 total = batch.count_source_images(book)
-                done = batch.count_images(book / 'result')
+                outputs = expected_outputs(book, output_format)
+                done, validation_errors = validate_outputs(outputs)
                 row = self.table.rowCount()
                 self.table.insertRow(row)
                 for col, text in ((0, book.name), (1, '待處理'), (3, '--:--')):
@@ -681,35 +975,76 @@ class Panel(QMainWindow):
                 self.table.setRowHeight(row, 32)
                 self.jobs.append(dict(book=book, total=total, done=done, status=status,
                                       process=None, start=None, end=None, last=time.monotonic(),
-                                      complete=None, tail='', decoder=None, path=None, file=None))
+                                      complete=None, tail='', decoder=None, path=None, file=None,
+                                      outputs=outputs, guard=None, cleanup=None, exit_code=None,
+                                      stop_reason=None, error=None))
             self.stats.setText(f'READY    {len(books)} 本書籍  /  {sum(j["total"] for j in self.jobs)} 頁')
             self.settings.setValue('root', self.root.text())
             self.scanned_root = Path(self.root.text()).expanduser().resolve()
             self.filter_books()
+            self.transition(Lifecycle.IDLE)
         except Exception as exc:
             QMessageBox.warning(self, '無法掃描書庫', str(exc))
 
     def start(self):
+        if not self.can_edit_jobs():
+            return
+        if not self.jobs or self.scanned_root != Path(self.root.text()).expanduser().resolve():
+            self.scan()
+        if not any(self.table.item(row, 0).checkState() == Qt.CheckState.Checked
+                   for row in range(len(self.jobs))):
+            QMessageBox.information(self, '尚未選擇書籍', '請先勾選要翻譯的書籍。')
+            return
         self.check_backend(launch=True)
 
-    def begin_translation(self):
+    def reset_job(self, job, outputs, selected):
+        if job.get('process') is not None or job.get('guard') is not None or job.get('cleanup') is not None:
+            raise RuntimeError('Cannot reset an owned/unverified process')
+        valid, _ = validate_outputs(outputs)
+        job.update(outputs=outputs, total=len(outputs), selected=selected, initial_valid=valid,
+                   initial_snapshot=output_snapshot(outputs), available=valid, done=valid,
+                   start=None, end=None, complete=None, exit_code=None, exit_status=None,
+                   stop_reason=None, error=None, tail='', decoder=None, path=None, file=None,
+                   baseline={}, snapshot={}, exit_seen=False, finalized=False,
+                   run_id=self.run_generation, status='待處理' if selected else '未選取')
+        if selected and self.options.force:
+            job['done'] = 0
+        elif selected and valid == len(outputs):
+            job['status'] = '已完成'
+
+    def begin_translation(self, approved=None):
+        # Internal entry used by synthetic P0 tests. GUI Start enters through the
+        # request-identified PREFLIGHT path; never reset a live/uncleaned job.
+        if self.closing or self.has_owned_processes() or self.lifecycle in (Lifecycle.RUNNING, Lifecycle.STOPPING):
+            return
+        if self.lifecycle == Lifecycle.PREFLIGHT and (
+                approved is None or not self.applicable_check(approved) or not self.pending_start):
+            return
         if self.scanned_root != Path(self.root.text()).expanduser().resolve():
+            if self.lifecycle == Lifecycle.PREFLIGHT:
+                self.cancel_pending_start()
+                return
             self.scan()
         if not self.jobs:
             self.scan()
         if not self.jobs:
             return
-        selected = [row for row in range(len(self.jobs))
-                    if self.table.item(row, 0).checkState() == Qt.CheckState.Checked]
+        selected = (self.pending_selection if self.lifecycle == Lifecycle.PREFLIGHT else
+                    tuple(self.jobs[row] for row in range(len(self.jobs))
+                          if self.table.item(row, 0).checkState() == Qt.CheckState.Checked))
         if not selected:
             QMessageBox.information(self, '尚未選擇書籍', '請先勾選要翻譯的書籍。')
+            self.cancel_pending_start()
             return
         try:
             batch.load_config_dict(Path(self.config.text()))
             if not Path(self.config.text()).is_file():
                 raise ValueError('設定檔不存在')
+            output_format = (batch.load_config_dict(Path(self.config.text())).get('cli') or {}).get('format')
+            output_sets = [expected_outputs(job['book'], output_format) for job in self.jobs]
         except Exception as exc:
             QMessageBox.warning(self, '設定檔錯誤', str(exc))
+            self.cancel_pending_start()
             return
         self.settings.setValue('config', self.config.text())
         self.options = batch.BatchOptions(
@@ -717,29 +1052,25 @@ class Panel(QMainWindow):
             use_gpu=False, batch_size=self.batch_size.value(),
             **{key: value for key, value in self.advanced.items() if key != 'timeout'},
         )
-        self.running = True
-        self.clear_button.setEnabled(False)
+        self.reset_summary()
+        self.run_generation += 1
         self.started = time.monotonic()
         self.ended = None
         self.batch_stopped = False
         self.stats.setStyleSheet('')
-        self.controls.setEnabled(False)
-        self.batch_settings_button.setEnabled(False)
-        self.scan_button.setEnabled(False)
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        for row, job in enumerate(self.jobs):
-            job['selected'] = row in selected
-            job.update(start=None, end=None, complete=None)
-            job['status'] = '待處理' if row in selected else '未選取'
-            item = self.table.item(row, 0)
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-            if job['done'] >= job['total'] and not self.options.force:
-                job['status'] = '已完成'
+        selected_ids = {id(job) for job in selected}
+        for job, outputs in zip(self.jobs, output_sets):
+            self.reset_job(job, outputs, id(job) in selected_ids)
+        self.run_jobs = tuple(job for job in self.jobs if job['selected'])
+        self.pending_start = False
+        self.pending_selection = None
+        self.pending_identity = None
+        self.log.clear()
+        self.transition(Lifecycle.RUNNING)
         self.schedule()
 
     def schedule(self):
-        if not self.running:
+        if self.lifecycle != Lifecycle.RUNNING:
             return
         active = sum(j['process'] is not None for j in self.jobs)
         for job in self.jobs:
@@ -749,9 +1080,10 @@ class Panel(QMainWindow):
                 continue
             logs = batch.PROJECT_ROOT / 'result' / 'batch_logs'
             logs.mkdir(parents=True, exist_ok=True)
-            job['path'] = batch.make_log_path(logs, self.jobs.index(job) + 1, job['book'].name)
+            path = batch.make_log_path(logs, self.jobs.index(job) + 1, job['book'].name)
+            job['path'] = path.with_name(f'{path.stem}_{self.run_generation}_{uuid.uuid4().hex[:8]}{path.suffix}')
             try:
-                job['file'] = job['path'].open('wb')
+                job['file'] = job['path'].open('xb')
             except OSError as exc:
                 job['status'] = '失敗'
                 job['tail'] = str(exc)
@@ -764,25 +1096,42 @@ class Panel(QMainWindow):
             env.insert('PYTHONIOENCODING', 'utf-8')
             process.setProcessEnvironment(env)
             command = batch.build_local_command(Path(sys.executable), job['book'], self.options)
+            if os.name == 'nt':
+                try:
+                    job['guard'] = WindowsJob()
+                    command = [sys.executable, str(Path(__file__).with_name('batch_job_runtime.py')),
+                               job['guard'].name, *command]
+                except Exception as exc:
+                    self.job_message(job, f'Cannot contain translator process: {exc}')
+                    job['status'] = '失敗'
+                    job['file'].close()
+                    job['file'] = None
+                    process.deleteLater()
+                    continue
+            job['baseline'] = output_snapshot(job['outputs'])
+            job['snapshot'] = job['baseline']
+            if self.options.force:
+                job['done'] = 0
             job.update(process=process, status='執行中', start=time.monotonic(),
                        last=time.monotonic(), decoder=codecs.getincrementaldecoder('utf-8')('replace'))
-            process.readyReadStandardOutput.connect(lambda j=job: self.drain(j))
-            process.finished.connect(lambda code, status, j=job: self.finished(j, code))
-            process.errorOccurred.connect(lambda error, j=job: self.process_error(j, error))
+            token = job['run_id']
+            process.readyReadStandardOutput.connect(lambda j=job, p=process, t=token:
+                                                    self.drain(j) if self.owns_callback(j, p, t) else None)
+            process.finished.connect(lambda code, status, j=job, p=process, t=token:
+                                     self.finished(j, code, status, p, t))
+            process.errorOccurred.connect(lambda error, j=job, p=process, t=token:
+                                          self.process_error(j, error) if self.owns_callback(j, p, t) else None)
             process.start(command[0], command[1:])
             if self.follow:
                 self.table.scrollToItem(self.table.item(self.jobs.index(job), 0))
             active += 1
         if not any(j['process'] is not None or j['status'] == '待處理' for j in self.jobs):
-            self.running = False
             self.complete_batch()
-            if self.notify:
-                QApplication.beep()
-                QApplication.alert(self, 5000)
-            self.controls.setEnabled(True)
-            self.scan_button.setEnabled(True)
-            self.start_button.setEnabled(self.backend_ok and self.backend_worker is None)
-            self.stop_button.setEnabled(False)
+        self.sync_ui()
+
+    def owns_callback(self, job, process, token):
+        return (job.get('process') is process and job.get('run_id') == token
+                and token == self.run_generation and not job.get('finalized'))
 
     def drain(self, job):
         if job['process'] is None:
@@ -794,132 +1143,205 @@ class Panel(QMainWindow):
         job['tail'] = (job['tail'] + job['decoder'].decode(data))[-60000:]
 
     def process_error(self, job, error):
-        if error == QProcess.ProcessError.FailedToStart:
+        if job['process'] is not None and error == QProcess.ProcessError.FailedToStart:
             job['tail'] += '\n' + job['process'].errorString()
             self.finished(job, -1)
 
-    def finished(self, job, code):
-        if job['process'] is None:
+    def job_message(self, job, message):
+        text = f'\n[Batch panel] {message}\n'
+        job['tail'] = (job['tail'] + text)[-60000:]
+        if job.get('file'):
+            job['file'].write(text.encode('utf-8'))
+            job['file'].flush()
+
+    def finished(self, job, code, exit_status=None, process=None, token=None):
+        if (job['process'] is None or job.get('exit_seen') or
+                (process is not None and not self.owns_callback(job, process, token))):
             return
+        job['exit_seen'] = True
         self.drain(job)
-        job['done'] = batch.count_images(job['book'] / 'result')
-        if job['status'] == '執行中':
-            job['status'] = '已完成' if job['done'] >= job['total'] else '失敗'
-            if code != 0:
-                job['tail'] += f'\nProcess exited with code {code}\n'
+        job['exit_code'] = code
+        job['exit_status'] = exit_status
+        if job.get('cleanup') is not None:
+            return  # Cleanup controller must verify the entire job first.
+        process, token = job['process'], job['run_id']
+        QTimer.singleShot(250, lambda j=job, p=process, t=token:
+                          self.after_exit(j) if self.owns_callback(j, p, t) else None)
+
+    def after_exit(self, job):
+        if job['process'] is None or job.get('cleanup') is not None:
+            return
+        try:
+            if job.get('guard') is not None and job['guard'].active_count():
+                self.terminate_job(job, '異常退出', 'Parent exited but contained descendants remain')
+                return
+        except Exception as exc:
+            self.terminate_job(job, '異常退出', f'Unable to verify descendants: {exc}')
+            return
+        self.finalize_job(job)
+
+    def finalize_job(self, job):
+        if job['process'] is None or job.get('finalized'):
+            return
+        job['done'], errors = validate_outputs(
+            job['outputs'], job.get('baseline') if self.options.force else None)
+        if job.get('stop_reason'):
+            job['status'] = job['stop_reason']
+        elif job.get('exit_code') != 0 or job.get('exit_status') == QProcess.ExitStatus.CrashExit:
+            job['status'] = '異常退出' if not errors else '失敗'
+        else:
+            job['status'] = '失敗' if errors else '已完成'
+        job['error'] = '; '.join(errors[:10]) or None
+        # Availability and overwrite progress are distinct: unchanged valid old
+        # pages can remain available without satisfying P0's current-run proof.
+        job['available'] = job['done']
+        if self.options.force:
+            job['available'], _ = validate_outputs(job['outputs'])
+        job['finalized'] = True
+        self.job_message(job, f"Result={job['status']}; exit={job.get('exit_code')}; "
+                         f"validated={job['done']}/{job['total']}; {job['error'] or ''}")
         job['end'] = time.monotonic()
-        job['file'].close()
+        if job['file']:
+            job['file'].close()
         job['file'] = None
+        if job.get('guard') is not None:
+            job['guard'].close()
+            job['guard'] = None
         job['process'].deleteLater()
         job['process'] = None
-        QTimer.singleShot(0, self.schedule)
+        token = self.run_generation
+        QTimer.singleShot(0, lambda: self.schedule() if token == self.run_generation else None)
+        self.sync_ui()
 
-    def terminate_job(self, job, status):
+    def terminate_job(self, job, status, detail=''):
         process = job['process']
-        if process is None or job['status'] != '執行中':
+        if process is None or job.get('cleanup') is not None:
             return
-        job['status'] = status
-        message = f'\n[Batch panel] {status}; outputs={job["done"]}/{job["total"]}\n'
-        job['tail'] += message
-        job['file'].write(message.encode('utf-8'))
-        job['file'].flush()
-        if os.name == 'nt' and process.processId():
-            cleaner = QProcess(self)
-            self.cleaners.append(cleaner)
-            def cleaned(*args):
-                if job['process'] is process:
-                    process.kill()
-                self.cleaners.remove(cleaner)
-                cleaner.deleteLater()
-            cleaner.finished.connect(cleaned)
-            cleaner.start('taskkill', ['/PID', str(process.processId()), '/T', '/F'])
-        else:
-            process.kill()
+        job['stop_reason'] = status
+        job['status'] = '清理中'
+        self.job_message(job, f'{status} requested. {detail}')
+        cleaner = ProcessCleanup(process, job.get('guard'), self)
+        job['cleanup'] = cleaner
+        self.cleaners.append(cleaner)
+        def cleaned(ok, message):
+            self.job_message(job, message)
+            job['cleanup'] = None
+            self.cleaners.remove(cleaner)
+            cleaner.deleteLater()
+            if ok:
+                self.finalize_job(job)
+            else:
+                # Retain process/job handles and block rerun/close: not confirmed stopped.
+                job['status'] = '清理失敗'
+                job['error'] = message
+                self.sync_ui()
+        cleaner.done.connect(cleaned)
+        cleaner.start()
+        self.sync_ui()
 
     def stop(self):
-        self.running = False
+        if not self.has_owned_processes() and self.lifecycle not in (Lifecycle.RUNNING, Lifecycle.STOPPING):
+            return
+        self.transition(Lifecycle.STOPPING)
         self.batch_stopped = True
         for job in self.jobs:
             if job['process'] is not None:
                 self.terminate_job(job, '已停止')
             elif job['status'] == '待處理':
                 job['status'] = '已停止'
-        self.stop_button.setEnabled(False)
+        self.sync_ui()
 
     def complete_batch(self):
-        if self.ended is not None or not self.started:
+        if (self.ended is not None or not self.started or not self.run_jobs
+                or self.lifecycle not in (Lifecycle.RUNNING, Lifecycle.STOPPING)
+                or self.has_owned_processes() or any(j['status'] == '待處理' for j in self.run_jobs)):
             return
         self.ended = time.monotonic()
-        selected = [job for job in self.jobs if job.get('selected')]
-        completed = sum(job['status'] == '已完成' for job in selected)
-        failed = sum(job['status'] in ('失敗', '停滯逾時', '總時間逾時') for job in selected)
-        if self.batch_stopped:
-            title, color, background = '工作已停止', '#ffd08c', '#423321'
-        elif failed:
+        metrics = self.batch_metrics()
+        completed, failed = metrics['completed'], metrics['failed']
+        if failed:
             title, color, background = '批次結束，部分工作失敗', '#ffacb4', '#43232d'
+        elif self.batch_stopped:
+            title, color, background = '工作已停止', '#ffd08c', '#423321'
         else:
             title, color, background = '全部翻譯完成', '#9aefbc', '#173c2b'
-        self.completion_text = (f'{title}   |   {completed} / {len(selected)} 本完成'
+        self.completion_text = (f'{title}   |   {completed} / {metrics["books"]} 本完成'
                                 f'   |   {failed} 本失敗   |   耗時 {batch.elapsed_text(self.started, self.ended)}')
         self.stats.setStyleSheet(f'background:{background};color:{color};border:1px solid {color};'
                                 'border-radius:8px;padding:12px;font-size:16px;font-weight:600;')
         self.stats.setText(self.completion_text)
+        self.transition(Lifecycle.FINISHED)
         if self.notify and not self.batch_stopped:
-            self.completion_box = QMessageBox(self)
-            self.completion_box.setWindowTitle(title)
-            self.completion_box.setIcon(QMessageBox.Icon.Warning if failed else QMessageBox.Icon.Information)
-            self.completion_box.setText(self.completion_text)
-            self.completion_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-            self.completion_box.show()
+            self.notify_completion(title, failed)
+        if self.queued_check is not None:
+            self.check_delay.start()
+
+    def notify_completion(self, title, failed):
+        QApplication.beep()
+        QApplication.alert(self, 5000)
+        self.completion_box = QMessageBox(self)
+        self.completion_box.setWindowTitle(title)
+        self.completion_box.setIcon(QMessageBox.Icon.Warning if failed else QMessageBox.Icon.Information)
+        self.completion_box.setText(self.completion_text)
+        self.completion_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        self.completion_box.show()
+
+    def batch_metrics(self):
+        jobs = self.run_jobs
+        failed = {'失敗', '異常退出', '清理失敗', '停滯逾時', '總時間逾時'}
+        progress = sum(min(j['done'], j['total']) for j in jobs)
+        before = sum(j['initial_valid'] for j in jobs)
+        return {
+            'books': len(jobs), 'completed': sum(j['status'] == '已完成' for j in jobs),
+            'failed': sum(j['status'] in failed for j in jobs),
+            'running': sum(j['process'] is not None for j in jobs),
+            'stopped': sum(j['status'] == '已停止' for j in jobs),
+            'pages_total': sum(j['total'] for j in jobs), 'pages_done': progress,
+            'pages_before': before, 'pages_available': sum(j['available'] for j in jobs),
+            'pages_added': sum(max(0, j['done'] - j['initial_valid']) for j in jobs) if not self.options.force else 0,
+            'pages_updated': progress if self.options.force else 0,
+            'elapsed': batch.elapsed_text(self.started, self.ended) if self.started else '--:--',
+        }
 
     def tick(self):
         now = time.monotonic()
         for row, job in enumerate(self.jobs):
-            if job['process'] is not None:
-                done = batch.count_images(job['book'] / 'result')
-                if done > job['done']:
+            if job['process'] is not None and job['status'] == '執行中':
+                snapshot = output_snapshot(job['outputs'])
+                if snapshot != job.get('snapshot'):
                     job['last'] = now
+                job['snapshot'] = snapshot
+                job['available'] = len(snapshot)
+                done = (sum(signature != job['baseline'].get(path) for path, signature in snapshot.items())
+                        if self.options.force else len(snapshot))
                 job['done'] = done
                 if self.advanced['timeout'] and now - job['start'] >= self.advanced['timeout']:
                     self.terminate_job(job, '總時間逾時')
-                if done >= job['total']:
-                    job['complete'] = job['complete'] or now
-                    if now - job['complete'] >= batch.COMPLETION_STABILITY_SECONDS:
-                        self.terminate_job(job, '已完成')
-                else:
-                    job['complete'] = None
-                    if self.stall.value() and now - job['last'] >= self.stall.value():
-                        self.terminate_job(job, '停滯逾時')
+                elif self.stall.value() and now - job['last'] >= self.stall.value():
+                    self.terminate_job(job, '停滯逾時')
             self.table.item(row, 1).setText(job['status'])
             color = {'執行中':'#80bbff', '已完成':'#78dba2', '失敗':'#ff8e97',
+                     '異常退出':'#ff8e97', '清理失敗':'#ff8e97', '清理中':'#ffc17b',
                      '停滯逾時':'#ffc17b', '總時間逾時':'#ffc17b'}.get(job['status'], '#aab6c8')
             self.table.item(row, 1).setForeground(QColor(color))
             bar = self.table.cellWidget(row, 2)
             bar.setValue(min(job['done'], job['total']))
             bar.setFormat(f'{job["done"]} / {job["total"]}')
             self.table.item(row, 3).setText(batch.elapsed_text(job['start'], job['end']))
-        active = sum(j['process'] is not None for j in self.jobs)
-        if not self.running and not active:
-            self.clear_button.setEnabled(not self.pending_start)
-            if self.started:
-                self.complete_batch()
-            self.batch_settings_button.setEnabled(True)
-            for row in range(len(self.jobs)):
-                item = self.table.item(row, 0)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            self.controls.setEnabled(True)
-            self.scan_button.setEnabled(True)
-            self.start_button.setEnabled(self.backend_ok and self.backend_worker is None)
-        if self.jobs and self.started:
-            done = sum(j['status'] == '已完成' for j in self.jobs)
-            pages = sum(min(j['done'], j['total']) for j in self.jobs)
-            total = sum(j['total'] for j in self.jobs)
+        self.complete_batch()
+        self.sync_ui()
+        if self.run_jobs and self.started:
+            metrics = self.batch_metrics()
+            done, pages, total = metrics['completed'], metrics['pages_done'], metrics['pages_total']
             self.overall.setRange(0, total)
             self.overall.setValue(pages)
             self.overall.setFormat(f'{pages} / {total} 頁')
-            self.stats.setText(f'{"RUNNING" if self.running else "IDLE"}    '
-                               f'{done} / {len(self.jobs)} 本完成     {active} 本執行中     '
-                               f'{pages} / {total} 頁     {batch.elapsed_text(self.started, self.ended)}')
+            self.stats.setText(f'{self.lifecycle.name}    '
+                               f'{done} / {metrics["books"]} 本完成     {metrics["running"]} 本執行中     '
+                               f'{pages} / {total} 頁     {metrics["elapsed"]}')
+            self.overall.setToolTip(f'本次選取 {metrics["books"]} 本；既有有效頁 {metrics["pages_before"]}；'
+                                    f'新增頁 {metrics["pages_added"]}；覆寫更新頁 {metrics["pages_updated"]}；'
+                                    f'目前輸出頁 {metrics["pages_available"]}（執行中為檔案進展，結束時驗證）')
             if self.ended is not None:
                 self.stats.setText(self.completion_text)
         self.show_log()
@@ -957,16 +1379,21 @@ class Panel(QMainWindow):
         super().mousePressEvent(event)
 
     def closeEvent(self, event):
-        if self.backend_worker is not None:
-            self.backend_worker.wait(5000)
-            if self.backend_worker.isRunning():
-                event.ignore()
-                return
-        if any(j['process'] is not None for j in self.jobs):
+        if self.has_owned_processes():
             QMessageBox.information(self, '工作尚未結束', '請先停止工作，等待子程序結束後再關閉視窗。')
             event.ignore()
-        else:
-            event.accept()
+            return
+        self.closing = True
+        self.check_delay.stop()
+        self.cancel_pending_start()
+        self.backend_generation += 1
+        self.queued_check = None
+        self.sync_ui()
+        if self.backend_worker is not None:
+            event.ignore()  # Finish asynchronously; never destroy a running QThread.
+            return
+        self.timer.stop()
+        event.accept()
 
 
 def main():
