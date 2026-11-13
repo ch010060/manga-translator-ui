@@ -48,10 +48,14 @@ class Page:
 		self.processing_time = None
 		t1 = time.time_ns()
 
-		with open(filename, 'rb') as f:
-			chunk = f.read()
-		nparr = np.frombuffer(chunk, np.uint8)
-		self.img = cv.imdecode(nparr, cv.IMREAD_COLOR)
+		if isinstance(filename, np.ndarray):  # in-memory 3-channel uint8 image (skips PNG round-trip)
+			self.img = filename
+			self.filename = filename = '<array>'
+		else:
+			with open(filename, 'rb') as f:
+				chunk = f.read()
+			nparr = np.frombuffer(chunk, np.uint8)
+			self.img = cv.imdecode(nparr, cv.IMREAD_COLOR)
 		if not isinstance(self.img, np.ndarray) or self.img.size == 0:
 			raise NotAnImageException(f"File {filename} is not an image")
 
@@ -158,11 +162,12 @@ class Page:
 			if dlines is None or dlines[0] is None:
 				break
 
-			for dline in dlines[0]:
-				x0 = int(round(dline[0][0]))
-				y0 = int(round(dline[0][1]))
-				x1 = int(round(dline[0][2]))
-				y1 = int(round(dline[0][3]))
+			# OpenCV 4.x returns (N,1,4), 5.x returns (N,4)
+			for dline in dlines[0].reshape(-1, 4):
+				x0 = int(round(dline[0]))
+				y0 = int(round(dline[1]))
+				x1 = int(round(dline[2]))
+				y1 = int(round(dline[3]))
 
 				a = x0 - x1
 				b = y0 - y1

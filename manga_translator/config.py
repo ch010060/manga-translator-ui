@@ -362,6 +362,8 @@ class InpainterConfig(BaseModel):
     """Inpainting precision for lama, use bf16 while you can."""
     force_use_torch_inpainting: bool = False
     """Force use PyTorch for inpainting instead of ONNX (useful if ONNX has memory issues)"""
+    inpainting_crop_pad: int = 0
+    """If > 0, inpaint only the mask regions, each cropped with this many pixels of context, instead of the whole page. 0 = whole page."""
 
 class ColorizerConfig(BaseModel):
     colorization_size: int = 576

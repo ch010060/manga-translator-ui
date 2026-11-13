@@ -835,8 +835,9 @@ class OCR(nn.Module):
                     cached_activations[idx * beams_k + best_beam_idx] 
 
             remaining_indexs = []
+            finished_set = set(finished_batch_indices.tolist())  # one host sync instead of one per i
             for i in range(N_remaining):
-                if i not in finished_batch_indices:
+                if i not in finished_set:
                     for j in range(beams_k):
                         remaining_indexs.append(i * beams_k + j)
 

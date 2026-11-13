@@ -27,13 +27,11 @@ class OfflineInpainter(CommonInpainter, ModelWrapper):
     
     def _cleanup_memory(self):
         """统一的Inpainting内存清理方法，在每次推理后自动调用"""
-        import gc
 
         import torch
 
-        gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache()  # gc.collect deferred to batch boundary
             if hasattr(torch.cuda, "ipc_collect"):
                 try:
                     torch.cuda.ipc_collect()

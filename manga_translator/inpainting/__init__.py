@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -140,6 +140,8 @@ async def dispatch(inpainter_key: Inpainter, image: np.ndarray, mask: np.ndarray
             inpainting_size,
             verbose,
         )
+    elif getattr(config, 'inpainting_crop_pad', 0) > 0:
+        inpainted_rgb = await _dispatch_with_crops(inpainter, image_rgb, mask_binary, config, inpainting_size, verbose)
     else:
         inpainted_rgb = await inpainter.inpaint(image_rgb, mask_binary, config, inpainting_size, verbose)
 
@@ -153,6 +155,53 @@ async def unload(inpainter_key: Inpainter):
     inpainter = inpainter_cache.pop(inpainter_key, None)
     if isinstance(inpainter, OfflineInpainter):
         await inpainter.unload()
+
+def _mask_crop_boxes(mask: np.ndarray, pad: int) -> List[Tuple[int, int, int, int]]:
+    """Bounding boxes of mask components, padded by `pad`.
+
+    Overlapping boxes are merged only when the merged rectangle is no larger than the two boxes
+    combined; inpaint cost is ~linear in area, so a big bounding rectangle costs more than the overlap.
+    """
+    h, w = mask.shape[:2]
+    n, _, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
+    boxes = [[max(x - pad, 0), max(y - pad, 0), min(x + bw + pad, w), min(y + bh + pad, h)]
+             for x, y, bw, bh, _ in stats[1:]]
+    area = lambda r: (r[2] - r[0]) * (r[3] - r[1])
+    merged = True
+    while merged:  # ponytail: O(n^2) per pass, n = text regions on a page (tens)
+        merged = False
+        out = []
+        for b in boxes:
+            for o in out:
+                u = [min(o[0], b[0]), min(o[1], b[1]), max(o[2], b[2]), max(o[3], b[3])]
+                if b[0] < o[2] and o[0] < b[2] and b[1] < o[3] and o[1] < b[3] and area(u) <= area(o) + area(b):
+                    o[:] = u
+                    merged = True
+                    break
+            else:
+                out.append(b)
+        boxes = out
+    return [tuple(b) for b in boxes]
+
+
+async def _dispatch_with_crops(
+    inpainter: CommonInpainter,
+    image: np.ndarray,
+    mask: np.ndarray,
+    config: InpainterConfig,
+    inpainting_size: int,
+    verbose: bool,
+) -> np.ndarray:
+    """Inpaint each padded mask region separately; only masked pixels are written back."""
+    result = image.copy()
+    for x0, y0, x1, y1 in _mask_crop_boxes(mask, config.inpainting_crop_pad):
+        m = mask[y0:y1, x0:x1]
+        res = await inpainter.inpaint(np.ascontiguousarray(image[y0:y1, x0:x1]), np.ascontiguousarray(m),
+                                      config, inpainting_size, verbose)
+        sel = m > 0
+        result[y0:y1, x0:x1][sel] = res[sel]
+    return result
+
 
 async def _dispatch_with_split(
     inpainter: CommonInpainter,
