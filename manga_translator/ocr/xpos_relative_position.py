@@ -53,8 +53,12 @@ class XPOS(nn.Module):
         self.register_buffer(
             "scale", (torch.arange(0, head_dim, 2) + 0.4 * head_dim) / (1.4 * head_dim)
         )
-        # ponytail: unbounded dict, but keys are (seq_len, offset) of one OCR decode, a few hundred entries
+        # shortcut: tables persist across pages; add a bound if measured growth warrants it.
         self._rope_cache = {}
+
+    def _apply(self, fn, recurse=True):
+        self._rope_cache.clear()
+        return super()._apply(fn, recurse=recurse)
 
     def forward(self, x, offset=0, downscale=False):
         key = (x.shape[1], offset, downscale, self.scale.device, self.scale.dtype, x.dtype)
