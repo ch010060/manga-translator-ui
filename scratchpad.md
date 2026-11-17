@@ -127,9 +127,13 @@ Profile 熱點：gc.collect ×6/page 0.43s；get_image_md5 PNG 編碼 ×3/page 0
 - panel detection IndexError：屬功能 bug，另案處理（修好不會變快）
 
 ## 進度紀錄
+- 2026-11-14 Windows 接手盤點完成：目前 `debug/perf-optimization@79aa0cb`；正式環境 Python3.12.13／torch2.8.0+cu128／CUDA12.8 可用／OpenCV4.13.0／threads16。未執行本分支效能測試，未修改production。統整計畫：`.omx/plans/windows-perf-validation-20261114.md`。先驗 panel／ROI／OCR／hash 等價與收益，再單獨加入廣泛GC；6頁預篩通過才擴樣與一次長跑。Windows stash `c71b44ab` 保留；RAM95／CLI overrides／profiling與啟動器需選擇性整合，不能整包套回。Mac21%／40%不是Windows端到端收益。
 - 2026-11-13 10:20 建立計畫，開始 Phase 1
 - 2026-11-13 10:35 Phase 1 完成並驗證（−19%，輸出一致）；未 commit，`git diff` 4 檔 +26/−18
 - 規則：途中遇到需安裝的依賴，先停下回報使用者，不先跑完
 - 2026-11-13 11:20 Phase 2 完成，交接報告寫入 doc/perf/
 - 2026-11-13 10:55 範圍改為非 LLM；重新 profile，熱點依 GPU/CPU 分類
 - 2026-11-13 10:45 Phase 3 完成：LLM 佔 54%；Phase 2 重排（P6 並行、P4b 裁切優先）
+
+### 2026-11-17 最終 commit 收斂
+最終採用 Bcpu，C1 已撤回原 GC 策略；12頁非 LLM 配對減時18.5%。含 C1 的30.7%及正式單輪8.8%不作最終收益承諾。commit 前99 tests及62 subtests通過（5.75秒）。crop=0、d=17、測試 FP32維持；不再長跑。分項 commits推送 feat/windows-pipeline-performance 並開至 main 的 PR。本機啟動器、圖片、logs、worktree與.omx資料不納入。

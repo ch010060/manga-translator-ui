@@ -1,5 +1,7 @@
 # manga-translator-ui 非 LLM 管線效能優化報告（交接給 Windows agent）
 
+> 歷史 Mac 報告：21%／40%為當時MPS樣本數據，不代表目前Windows分支收益。Windows最終保留CPU優化、撤回C1廣泛GC降頻，受控非LLM配對減時18.5%；最新結論見 [Windows驗證報告](windows-validation-results.md)。
+
 > 產出：2026-11-13，於 Mac（M5 Pro / MPS）實測。目標平台：Windows RTX 5090（CUDA）。
 > 範圍：LLM 翻譯以外的所有階段（偵測、OCR、文字合併、mask、inpainting、渲染）。
 > 進度原始紀錄：repo 根目錄 `scratchpad.md`。

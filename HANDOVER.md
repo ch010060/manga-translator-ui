@@ -1,5 +1,11 @@
 # 交接：非 LLM 管線效能優化（給 Windows agent 接手）
 
+> **Windows 最終採用結論（2026-11-17）**：保留 CPU 優化，撤回 C1 廣泛 GC 降頻，維持既有清理策略。固定12頁配對非LLM耗時下降 **18.5%**，consumer圖片／OCR／排序／精修mask完全一致。下方 Mac 數據及 W0–W6 為原始交接紀錄；後續以 `doc/perf/windows-validation-results.md` 的最終決策為準，**不再安排長跑**。
+>
+> crop仍0、偵測bilateral仍17、實際測試設定FP32。含C1的30.7%與正式15頁8.8%不屬於最終採用組的收益承諾。短批次含Sakura波動大，不宣稱整書加速比例。
+
+## 原始 Mac 交接紀錄
+
 > 分支：`debug/perf-optimization`（base：`main` @ `86fe508`）
 > 前一位 agent 在 Mac（M5 Pro / MPS）完成實作與實測；**你的任務是在 Windows RTX 5090（CUDA）上驗證、補完並收斂**。
 > 背景與完整數據：`doc/perf/optimization-report.md`；逐步過程紀錄：`scratchpad.md`。
@@ -8,7 +14,7 @@
 
 - 目標：縮短 **LLM 以外**的每頁處理時間（偵測、OCR、文字合併、mask、inpainting、渲染）。LLM 不在範圍內。
 - Mac 實測（不含 LLM）：原始 4.12s/頁 → 本分支預設設定 **3.24s（−21%）** → 加兩項建議設定 **2.49s（−40%）**。
-- 程式修改在 Mac 上驗證過輸出一致；**CUDA 上尚未驗證任何一項**。
+- 本節記錄 Mac 交接當時的結果；後續 CUDA 驗證與採用範圍見 Windows 報告。
 - 兩項建議設定（inpainting 裁切、偵測濾波 d=9）有畫質取捨，**預設未開啟**，需使用者以更多頁目視決定。
 
 ## 工作規則（使用者明確要求，務必遵守）
@@ -28,7 +34,7 @@
 
 | 項目 | 狀態 | CUDA 驗證 |
 |---|---|---|
-| C1 `gc.collect` 只在批次邊界 | 已實作 | ❌ 待驗（VRAM） |
+| C1 `gc.collect` 只在批次邊界 | **已撤回，保留原策略** | 未做長跑，不採用 |
 | C2 `get_image_md5` 改 hash 原始像素 | 已實作 | 低風險 |
 | C3 OCR XPOS 位置編碼 memoize | 已實作 | 低風險（需確認輸出一致） |
 | C4 panel 偵測 OpenCV 5.x 相容 | 已實作 | ❌ 待確認 OpenCV 版本 |
