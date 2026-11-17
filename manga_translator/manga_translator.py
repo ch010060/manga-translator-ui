@@ -1923,7 +1923,7 @@ class MangaTranslator:
         
         logger.info(f"模型 {tool}/{model} 已卸载，内存已清理")
 
-    def _cleanup_gpu_memory(self, aggressive: bool = False, gc_collect: Optional[bool] = None):
+    def _cleanup_gpu_memory(self, aggressive: bool = False):
         """清理 GPU 显存的辅助方法。
 
         Args:
@@ -1931,13 +1931,10 @@ class MangaTranslator:
                         批次边界与模型卸载后建议 True。
         """
         import gc
-        device_str = str(getattr(self, 'device', ''))
-        # ponytail: gc.collect costs ~70ms/call on a model-sized heap; collect at batch boundaries (aggressive) only.
-        # Per-page CUDA empty_cache below is kept. If long CUDA batches show VRAM creep, pass gc_collect=True per page.
-        if aggressive if gc_collect is None else gc_collect:
-            gc.collect()
+        gc.collect()
 
         # 仅在 CUDA 设备下执行显存清理；MPS 目前无等价 empty_cache。
+        device_str = str(getattr(self, 'device', ''))
         if device_str.startswith('cuda'):
             try:
                 import torch
@@ -3001,8 +2998,7 @@ class MangaTranslator:
         self._log_cuda_memory_snapshot("inpainting/before_cleanup")
 
         # 修复前先执行一次激进显存清理，降低并发/长批次下的显存碎片与OOM概率。
-        # 每页仍做 CUDA empty_cache；gc.collect 留到批次边界
-        self._cleanup_gpu_memory(aggressive=True, gc_collect=False)
+        self._cleanup_gpu_memory(aggressive=True)
         self._log_cuda_memory_snapshot("inpainting/after_cleanup")
         snapshot = self._get_cuda_memory_snapshot()
         if snapshot is not None:
@@ -3081,7 +3077,9 @@ class MangaTranslator:
             del ctx.img_inpainted
             ctx.img_inpainted = None
         
-        # 垃圾回收留到批次边界（_cleanup_batch_memory）
+        # 强制垃圾回收，释放内存
+        import gc
+        gc.collect()
         
         return output
 
