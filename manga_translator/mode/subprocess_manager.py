@@ -7,6 +7,7 @@
 import multiprocessing
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -66,6 +67,8 @@ def worker_translate_batch(
     子进程工作函数：翻译一批图片
     """
     import asyncio
+    from manga_translator.profiling import WorkerProfile
+    profile = None
     
     async def _do_translate():
         # 添加路径
@@ -74,8 +77,9 @@ def worker_translate_batch(
         
         import logging
 
-        from manga_translator import Config, MangaTranslator
-        from manga_translator.utils import init_logging, open_pil_image, set_log_level
+        with profile.span('worker_imports'):
+            from manga_translator import Config, MangaTranslator
+            from manga_translator.utils import init_logging, open_pil_image, set_log_level
         
         init_logging()
         set_log_level(logging.DEBUG if verbose else logging.INFO)
@@ -96,7 +100,11 @@ def worker_translate_batch(
         # 创建翻译器
         translator_params = cli_config.copy()
         translator_params.update(config_dict)
-        translator = MangaTranslator(params=translator_params)
+        with profile.span('translator_init'):
+            translator = MangaTranslator(params=translator_params)
+        profile.install(translator)
+        profile.write('worker_start', effective_cli=cli_config, input_count=len(file_paths),
+                      memory_limit_percent=memory_limit_percent, memory_limit_mb=memory_limit_mb)
         
         # 创建 Config 对象
         explicit_keys = {'render', 'upscale', 'translator', 'detector', 'colorizer', 'inpainter', 'ocr'}
@@ -129,9 +137,13 @@ def worker_translate_batch(
             current_index = start_index + i + 1
             print(f"\n[{current_index}/{total_files}] 处理: {os.path.basename(file_path)}")
             
+            profile.page = file_path
+            page_started = time.perf_counter_ns()
+            page_ok = False
             try:
-                with open(file_path, 'rb') as f:
-                    image = open_pil_image(f, eager=True)
+                with profile.span('read_image'):
+                    with open(file_path, 'rb') as f:
+                        image = open_pil_image(f, eager=True)
                 image.name = file_path
                 
                 contexts = await translator.translate_batch(
@@ -144,6 +156,7 @@ def worker_translate_batch(
                 if contexts and len(contexts) > 0:
                     ctx = contexts[0]
                     if getattr(ctx, 'success', False) or getattr(ctx, 'result', None):
+                        page_ok = True
                         completed.append(file_path)
                         print(f"✅ 完成: {os.path.basename(file_path)}")
                     else:
@@ -164,6 +177,17 @@ def worker_translate_batch(
                     import traceback
                     traceback.print_exc()
             
+            if profile.file:
+                try:
+                    ocr_cache = profile.ocr_cache_snapshot()
+                except Exception as exc:
+                    profile.write('monitor_error', monitor='ocr_cache', error_type=type(exc).__name__)
+                    ocr_cache = None
+                profile.write('page_result', ok=page_ok,
+                              duration_ns=time.perf_counter_ns() - page_started,
+                              cuda_memory=translator._get_cuda_memory_snapshot(),
+                              ocr_cache=ocr_cache)
+            profile.flush()
             if (i + 1) % 5 == 0:
                 pass
                 try:
@@ -182,19 +206,26 @@ def worker_translate_batch(
                 
                 # 检查是否超过绝对内存限制
                 if memory_limit_mb > 0 and mem_mb > memory_limit_mb:
+                    profile.write('worker_end', reason='process_memory', completed=len(completed))
+                    profile.close()
                     print(f"⚠️ 进程内存超过限制 ({mem_mb:.0f} MB > {memory_limit_mb} MB)，提前退出")
                     print(f"📊 已完成 {len(completed)} 个文件，剩余文件将在新子进程中处理")
                     return completed, failed
                 
                 # 检查是否超过系统内存百分比限制
                 if memory_limit_percent > 0 and sys_mem_percent > memory_limit_percent:
+                    profile.write('worker_end', reason='system_memory', completed=len(completed))
+                    profile.close()
                     print(f"⚠️ 系统内存超过限制 ({sys_mem_percent:.1f}% > {memory_limit_percent}%)，提前退出")
                     print(f"📊 已完成 {len(completed)} 个文件，剩余文件将在新子进程中处理")
                     return completed, failed
         
+        profile.write('worker_end', reason='completed', completed=len(completed), failed=len(failed))
+        profile.close()
         return completed, failed
     
     try:
+        profile = WorkerProfile(os.environ.get('MANGA_PROFILE_DIR'))
         completed, failed = asyncio.run(_do_translate())
         print(f"\n📤 子进程发送结果: 成功 {len(completed)}, 失败 {len(failed)}")
         result_queue.put({
@@ -203,6 +234,8 @@ def worker_translate_batch(
             'failed': failed
         })
     except Exception as e:
+        if profile is not None:
+            profile.write('worker_end', reason='error', error_type=type(e).__name__)
         import traceback
         print(f"\n❌ 子进程异常: {e}")
         result_queue.put({
@@ -212,6 +245,9 @@ def worker_translate_batch(
             'completed': [],
             'failed': []
         })
+    finally:
+        if profile is not None:
+            profile.close()
 
 
 async def translate_with_subprocess(

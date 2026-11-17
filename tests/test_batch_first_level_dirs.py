@@ -122,12 +122,13 @@ class BatchFirstLevelDirsTests(unittest.TestCase):
 
         self.assertTrue(args.concurrent)
 
-    def test_batch_parser_uses_benchmarked_fast_defaults(self):
+    def test_batch_parser_uses_current_serial_worker_defaults(self):
         args = parse_args(["--root", "D:/manga/root"])
 
         self.assertEqual(args.concurrency, 5)
-        self.assertEqual(args.batch_size, 6)
-        self.assertTrue(args.intra_book_concurrent)
+        self.assertEqual(args.batch_size, 4)
+        self.assertFalse(args.intra_book_concurrent)
+        self.assertEqual(args.memory_percent, 95)
 
     def test_batch_parser_can_disable_default_intra_book_concurrent_pipeline(self):
         args = parse_args(["--root", "D:/manga/root", "--no-intra-book-concurrent"])
