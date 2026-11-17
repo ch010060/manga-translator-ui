@@ -53,8 +53,22 @@ class XPOS(nn.Module):
         self.register_buffer(
             "scale", (torch.arange(0, head_dim, 2) + 0.4 * head_dim) / (1.4 * head_dim)
         )
+        # shortcut: tables persist across pages; add a bound if measured growth warrants it.
+        self._rope_cache = {}
+
+    def _apply(self, fn, recurse=True):
+        self._rope_cache.clear()
+        return super()._apply(fn, recurse=recurse)
 
     def forward(self, x, offset=0, downscale=False):
+        key = (x.shape[1], offset, downscale, self.scale.device, self.scale.dtype, x.dtype)
+        tables = self._rope_cache.get(key)
+        if tables is None:
+            tables = self._rope_cache[key] = self._rope_tables(x, offset, downscale)
+        sin, cos = tables
+        return (x * cos) + (rotate_every_two(x) * sin)
+
+    def _rope_tables(self, x, offset, downscale):
         length = x.shape[1]
         min_pos = -(length + offset) // 2
         max_pos = length + offset + min_pos
@@ -69,8 +83,8 @@ class XPOS(nn.Module):
         if downscale:
             scale = 1 / scale
 
-        x = apply_rotary_pos_emb(x, sin, cos, scale)
-        return x
+        # same math as apply_rotary_pos_emb, tables precomputed once
+        return tuple(duplicate_interleave(t * scale) for t in (sin, cos))
 
 
 class XPOS2D(nn.Module):

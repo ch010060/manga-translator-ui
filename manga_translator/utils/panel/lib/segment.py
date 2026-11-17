@@ -202,21 +202,23 @@ class Segment:
 		while unioned_segments:
 			unioned_segments = False
 			dedup_segments = []
-			used = []
+			# set of order-insensitive endpoint keys: same membership semantics as __eq__, O(1) instead of O(n)
+			used = set()
+			key = lambda s: (min(s.a, s.b), max(s.a, s.b))
 			for i, s1 in enumerate(segments):
 				for s2 in segments[i + 1:]:
-					if s2 in used:
+					if key(s2) in used:
 						continue
 
 					s3 = s1.union(s2)
 					if s3 is not None:
 						unioned_segments = True
 						dedup_segments += [s3]
-						used.append(s1)
-						used.append(s2)
+						used.add(key(s1))
+						used.add(key(s2))
 						break
 
-				if s1 not in used:
+				if key(s1) not in used:
 					dedup_segments += [s1]
 
 			segments = dedup_segments

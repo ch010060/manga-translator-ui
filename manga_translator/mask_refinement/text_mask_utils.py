@@ -62,6 +62,20 @@ def rect_distance(x1, y1, x1b, y1b, x2, y2, x2b, y2b):
     else:             # rectangles intersect
         return 0
     
+def _bilateral_region(img, x, y, w, h, d=17, sigma_color=80, sigma_space=80):
+    """bilateralFilter(img)[y:y+h, x:x+w] without filtering the whole page.
+
+    Non-uint8 backends can depend on the full image's range, so retain that path.
+    """
+    if img.dtype != np.uint8:
+        return np.ascontiguousarray(cv2.bilateralFilter(img, d, sigma_color, sigma_space)[y:y+h, x:x+w])
+    r = d // 2
+    H, W = img.shape[:2]
+    X0, Y0, X1, Y1 = max(x - r, 0), max(y - r, 0), min(x + w + r, W), min(y + h + r, H)
+    f = cv2.bilateralFilter(np.ascontiguousarray(img[Y0:Y1, X0:X1]), d, sigma_color, sigma_space)
+    return np.ascontiguousarray(f[y - Y0: y - Y0 + h, x - X0: x - X0 + w])
+
+
 def extend_rect(x, y, w, h, max_x, max_y, extend_size):
     x1 = max(x - extend_size, 0)
     y1 = max(y - extend_size, 0)
@@ -349,7 +363,6 @@ def _complete_mask_core(img: np.ndarray, mask: np.ndarray, textlines: List[Quadr
     textline_rects[:, 3] -= textline_rects[:, 1]
     
     final_mask = np.zeros_like(mask)
-    img = cv2.bilateralFilter(img, 17, 80, 80)
     for i, cc in enumerate(tqdm(textline_ccs, '[mask]')):
         x1, y1, w1, h1 = textline_rects[i]
         text_size = min(w1, h1, textlines[i].font_size)
@@ -359,7 +372,7 @@ def _complete_mask_core(img: np.ndarray, mask: np.ndarray, textlines: List[Quadr
         cc_region = np.ascontiguousarray(cc[y1: y1 + h1, x1: x1 + w1])
         if cc_region.size == 0:
             continue
-        img_region = np.ascontiguousarray(img[y1: y1 + h1, x1: x1 + w1])
+        img_region = _bilateral_region(img, x1, y1, w1, h1)
         cc_region = refine_mask(img_region, cc_region)
         cc[y1: y1 + h1, x1: x1 + w1] = cc_region
         x2, y2, w2, h2 = extend_rect(x1, y1, w1, h1, img.shape[1], img.shape[0], -(-dilate_size // 2))

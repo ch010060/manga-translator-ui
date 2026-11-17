@@ -126,6 +126,17 @@ def _should_skip_existing_cli_file(file_path, cli_config, translator=None, save_
     return False, ""
 
 
+def apply_cli_overrides(config_dict, args):
+    """Use the same explicit CLI overrides in normal and subprocess local modes."""
+    cli = config_dict.setdefault('cli', {})
+    for key in ('use_gpu', 'disable_onnx_gpu', 'format', 'batch_size', 'attempts'):
+        value = getattr(args, key, None)
+        if value is not None:
+            cli[key] = value
+    if getattr(args, 'concurrent', False):
+        cli['batch_concurrent'] = True
+
+
 async def translate_files(input_paths, output_dir, config_service, verbose=False, overwrite=False, args=None):
     """翻译文件（使用 UI 层的逻辑）"""
     
@@ -213,30 +224,7 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
     else:
         overwrite = cli_config.get('overwrite', False)
     
-    # use_gpu: 命令行参数优先
-    if hasattr(args, 'use_gpu') and args.use_gpu is not None:
-        cli_config['use_gpu'] = args.use_gpu
-
-    # disable_onnx_gpu: 命令行参数优先
-    if hasattr(args, 'disable_onnx_gpu') and args.disable_onnx_gpu is not None:
-        cli_config['disable_onnx_gpu'] = args.disable_onnx_gpu
-    
-    # format: 命令行参数优先
-    if hasattr(args, 'format') and args.format is not None:
-        cli_config['format'] = args.format
-    
-    # batch_size: 命令行参数优先
-    if hasattr(args, 'batch_size') and args.batch_size is not None:
-        cli_config['batch_size'] = args.batch_size
-    
-    # attempts: 命令行参数优先
-    if hasattr(args, 'attempts') and args.attempts is not None:
-        cli_config['attempts'] = args.attempts
-    
-    # concurrent: 命令行参数优先，否则使用配置文件中的值
-    if hasattr(args, 'concurrent') and args.concurrent:
-        cli_config['batch_concurrent'] = True
-    # 如果命令行没有指定，保留配置文件中的 batch_concurrent 值（已在 cli_config 中）
+    apply_cli_overrides(config_dict, args)
     
     config_dict['cli'] = cli_config
     
@@ -773,10 +761,7 @@ async def run_local_mode(args):
         try:
             config_dict = config_service.get_config().model_dump()
             cli_config = config_dict.get('cli', {})
-            if hasattr(args, 'use_gpu') and args.use_gpu is not None:
-                cli_config['use_gpu'] = args.use_gpu
-            if hasattr(args, 'disable_onnx_gpu') and args.disable_onnx_gpu is not None:
-                cli_config['disable_onnx_gpu'] = args.disable_onnx_gpu
+            apply_cli_overrides(config_dict, args)
             cli_config['save_to_source_dir'] = bool(getattr(args, 'save_to_source_dir', False))
             cli_config['source_result_dir'] = getattr(args, 'source_result_dir', 'manga_translator_work/result')
             config_dict['cli'] = cli_config

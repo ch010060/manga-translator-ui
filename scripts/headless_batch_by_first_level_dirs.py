@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONCURRENCY = 5        # fills SakuraLLM n=8 slots; each book emits 1 serial request
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_ATTEMPTS = 2
-DEFAULT_MEMORY_PERCENT = 85    # raised from 80 so concurrency=5 doesn't trip early exits
+DEFAULT_MEMORY_PERCENT = 95
 DEFAULT_MEMORY_LIMIT = 0
 DEFAULT_BATCH_PER_RESTART = 0  # 0=never restart mid-book; restarts silently stall progress
 COMPLETION_STABILITY_SECONDS = 8.0   # shortened from 30 so finished books are reaped fast
