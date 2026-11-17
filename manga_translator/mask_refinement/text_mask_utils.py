@@ -65,9 +65,10 @@ def rect_distance(x1, y1, x1b, y1b, x2, y2, x2b, y2b):
 def _bilateral_region(img, x, y, w, h, d=17, sigma_color=80, sigma_space=80):
     """bilateralFilter(img)[y:y+h, x:x+w] without filtering the whole page.
 
-    The filter only reads pixels within d//2, so filtering the rect padded by d//2
-    (clipped to the image, where the border reflection is the same) is bit-identical.
+    Non-uint8 backends can depend on the full image's range, so retain that path.
     """
+    if img.dtype != np.uint8:
+        return np.ascontiguousarray(cv2.bilateralFilter(img, d, sigma_color, sigma_space)[y:y+h, x:x+w])
     r = d // 2
     H, W = img.shape[:2]
     X0, Y0, X1, Y1 = max(x - r, 0), max(y - r, 0), min(x + w + r, W), min(y + h + r, H)
