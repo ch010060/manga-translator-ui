@@ -392,6 +392,7 @@ class ModelWrapper(ABC):
         if not self.is_loaded():
             await self._load(device=device, **kwargs)
             self._loaded = True
+            print(f'[model-load] {type(self).__name__} device={device}', flush=True)
 
     async def unload(self):
         if self.is_loaded():

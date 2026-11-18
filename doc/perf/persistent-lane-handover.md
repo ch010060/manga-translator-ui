@@ -1,7 +1,7 @@
 # 交接：Persistent Lane（P0）— Windows 驗證
 
 > 分支：`feat/persistent-lane`（base：`main` @ `0a1d61f`）
-> commits：`3d38358`（CLI `--book-lane`）、`3b5b423`（Batch Console lane 排程）
+> commits：`3d38358`（CLI `--book-lane`）、`3b5b423`（Batch Console lane 排程）、review 修正（記憶體保護、失敗計數、model-load 標記）
 > Mac 端已完成 P0-A／P0-B（正確性）；**你的任務是 P0-C（Windows 效能與資源短測），P0-D 有條件執行**。
 
 ## TL;DR
@@ -27,13 +27,15 @@ GUI 的預設值來自 `headless_batch_by_first_level_dirs.parse_args`：`--subp
 | worker 對**每一頁**單獨呼叫 `translate_batch` | `批次大小=4` 實際無效；Sakura 每頁一個請求；批次清理（gc、aggressive CUDA cleanup、`SetProcessWorkingSetSize`）每頁執行 |
 | 系統 RAM > 95% 時 worker 提前退出、父程序重開子程序 | **書中途重載整套模型**；RAM 滿載時可能反覆發生，與「速度掉下來又恢復」吻合（待證） |
 
+注意：子程序模式是「一個子程序依序處理多頁」，不是每頁新開子程序；只有記憶體保護、`batch_per_restart` 或異常才會讓同一本書多次載入模型。
+
 ### 立即可做、零成本的證據收集（先做）
 在 Windows 的 `result/batch_logs/` 搜尋 2500 頁那次的 log：
 ```powershell
 Select-String -Path result\batch_logs\*.log -Pattern "系统内存超过限制","进程内存超过限制" | Measure-Object
 Select-String -Path result\batch_logs\*.log -Pattern "系统内存超过限制" | Select-Object -First 5
 ```
-- 次數 > 0：確認長跑中有記憶體保護觸發的子程序重啟（每次 = 模型重載）。回報次數與時間分佈。
+- 次數 > 0 時，**再確認每則訊息之後是否真的出現新的 `🔄 批次 N` 行**（= 新子程序 = 模型重載）；只用超限訊息數量不能代表重載次數。回報實際重啟次數與時間分佈。
 
 ## Lane 模式與舊流程的行為差異（驗證時必須知道）
 
@@ -42,7 +44,7 @@ Select-String -Path result\batch_logs\*.log -Pattern "系统内存超过限制" 
 | 程序 | 每本書 1 個父程序 + 子程序 | 每 lane 1 個程序，依序處理 ≤ N 本 |
 | 模型載入 | 每本書（+ 每次記憶體保護重啟） | 每 lane 1 次 |
 | `--subprocess` | 有 | **自動移除**（lane 本身即有限生命週期 worker） |
-| 95% 記憶體保護 | 有 | **無**（以 lane 本數上限自然回收代替） |
+| 95% 記憶體保護 | 有（超限 → 子程序重開） | **有**：沿用 `--memory-percent/--memory-limit`；超限時在批次／頁面邊界停止（已存頁保留），lane 不再領下一本，送 `lane_exit`；GUI 將被中斷與未輪到的書重排（每本最多 3 次，不佔崩潰重排額度） |
 | 翻譯分組 | 每頁一個 Sakura 請求 | **依 `批次大小` 分批**（同一本書內；不跨書） |
 | 完成判定 | 程序退出 + 驗證輸出 | 每本書各自驗證輸出（`[LANE_EVENT]` 只是通知） |
 | 中途崩潰 | 該本書異常退出 | 已完成的書保留；未輪到的書重新排隊 1 次 |
@@ -64,7 +66,11 @@ python -m pytest tests\test_book_lane.py tests\test_batch_panel_lane.py -q
   typeperf "\GPU Process Memory(*)\Dedicated Usage" "\GPU Process Memory(*)\Shared Usage" "\Memory\Available MBytes" -si 5 -o run_<name>.csv
   nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv -l 5 > vram_<name>.csv
   ```
-  另記：整批 wall、成功頁數、模型初始化次數（舊流程：`result/batch_logs` 中 `🔄 批次` 行數，每行 = 一個子程序；Lane：`初始化翻译器` 行數，每行 = 一個 lane）、記憶體保護重啟次數、llama-server log 的 eval tok/s。
+  - WDDM 下 `nvidia-smi` 的逐程序顯存欄位可能顯示 N/A，**以 typeperf 的 GPU Process Memory 計數器為主**。
+  - 另記：整批 wall、成功頁數、**實際模型載入次數**（`result/batch_logs` 中 `[model-load]` 行數；兩種模式都會印，逐模型類別統計）、記憶體保護觸發次數（舊流程 `系统内存超过限制`；lane `lane_exit`）、llama-server log 的 eval tok/s。
+  ```powershell
+  Select-String -Path result\batch_logs\*.log -Pattern "\[model-load\]" | Group-Object { ($_.Line -split ' ')[1] } | Select Name, Count
+  ```
 
 ### 組別（同時處理固定 3）
 | 組 | 設定 |
@@ -79,8 +85,8 @@ python -m pytest tests\test_book_lane.py tests\test_batch_panel_lane.py -q
 | 項目 | Pass |
 |---|---|
 | 正確性 | 所有書 `已完成`、輸出頁數完整；無跨書（lane log 中每本書各自一段 `批量翻译完成`） |
-| 模型重用 | Lane 組 `初始化翻译器` 次數 = lane 程序數（約 書本數 / 4），遠低於 L3 的 `🔄 批次` 次數 |
-| 顯存 | Lane 組 Shared GPU Memory 無持續增長 |
+| 模型重用 | Lane 組每類模型的 `[model-load]` 次數 = lane 程序數（約 書本數 / 4），遠低於 L3 |
+| 顯存 | Shared GPU Memory 不隨 Dedicated 逼近上限而異常增長，且其增長時段與 Sakura tok/s 下降無對應；Dedicated 峰值低於容量 |
 | 記憶體 | 無持續上升；每個 lane 結束後回落 |
 | 效能 | N3-b1 兩輪平均 wall < L3 兩輪平均，且差距大於 L3 兩輪間差異 |
 | 故障 | 若有 lane 崩潰：已完成的書保留、未完成的書重排一次後完成 |
@@ -108,6 +114,14 @@ P0-C 結果：PASS / FAIL / 待使用者決定
 | 設定預設 | `scripts/headless_batch_by_first_level_dirs.py`：`--lane-books`（預設 0） |
 | 測試 | `tests/test_book_lane.py`、`tests/test_batch_panel_lane.py` |
 
-## 已知限制
-- Lane 模式沒有 95% 記憶體保護；若 P0-C 顯示 lane 內記憶體持續上升，再在 `run_book_lane` 書與書之間加入水位檢查（提前結束讓 GUI 重排），目前不預先實作。
+## 合併前必須在 Windows 跑的測試（雲端缺 torch 無法執行）
+```powershell
+python -m pytest tests\test_book_lane.py tests\test_batch_panel_lane.py tests\test_batch_panel_p0.py tests\test_batch_panel_p1.py tests\test_batch_panel_p2.py tests\test_batch_panel_v2.py tests\test_batch_first_level_dirs.py -q
+```
+- `test_book_lane.py` 的 `end_book` 與 `TranslateFilesErrorCountTests` 需要 torch（翻譯核心），只能在本機環境跑。
+- 雲端（Linux，無 torch）已跑：GUI 相關 113 passed；2 個環境性失敗（V15 需 Windows Qt platform；`default_config_path` 需本機 `examples/config.json`，未改動前同樣失敗）。
+
+## 已知限制 / 待辦
+- GUI 逐書狀態要等整條 lane 結束才結算（一條 lane 5 本時，前 4 本會顯示執行中直到第 5 本結束）。不影響正確性，排在 P0-C 之後處理（review P1）。
+- `lane_exit` 記憶體重排上限每本 3 次；覆寫模式（force）下重排會重做已完成頁，不覆寫模式則會跳過已存頁。
 - 書內並行（`--concurrent`）在 Mac 上結束時會 segfault（exit 139，輸出正確），未納入 lane，勿同時開啟。

@@ -42,6 +42,7 @@ BATCH_RANGES = {
 BATCH_FLAGS = ('intra_book_concurrent', 'use_subprocess', 'force')
 LANE_EVENT_PREFIX = '[LANE_EVENT] '  # printed by `local --book-lane`, one JSON object per book
 LANE_STOP = '__lane__'  # stop reason for a lane leader stopped on behalf of another book
+LANE_MEMORY_REQUEUES = 3  # per book: lane stopped by the RAM limit; separate from the one crash retry
 
 
 THEME = {
@@ -1192,6 +1193,7 @@ class Panel(QMainWindow):
                    stop_reason=None, error=None, tail='', decoder=None, path=None, file=None,
                    baseline={}, snapshot={}, exit_seen=False, finalized=False,
                    lane=None, lane_event=None, lane_waiting=False, lane_retries=0, event_buf='',
+                   lane_exit=None, memory_requeues=0,
                    run_id=self.run_generation, status='待處理' if selected else '未選取')
         if selected and self.options.force:
             job['done'] = 0
@@ -1313,7 +1315,7 @@ class Panel(QMainWindow):
                 member.update(process=process, status='執行中', start=now, last=now,
                               decoder=codecs.getincrementaldecoder('utf-8')('replace'),
                               lane=group if lane_books else None, lane_event=None, event_buf='',
-                              lane_waiting=member is not job)
+                              lane_exit=None, lane_waiting=member is not job)
                 if member is not job:  # share the leader's log file and job object
                     member.update(path=job['path'], file=job['file'], guard=job.get('guard'))
             token = job['run_id']
@@ -1363,6 +1365,9 @@ class Panel(QMainWindow):
             try:
                 event = json.loads(line[at + len(LANE_EVENT_PREFIX):])
             except ValueError:
+                continue
+            if event.get('event') == 'lane_exit':
+                leader['lane_exit'] = event
                 continue
             for member in lane:
                 if member['lane_event'] is None and self.same_path(member['book'], event.get('book', '')):
@@ -1457,6 +1462,7 @@ class Panel(QMainWindow):
         Books the lane never reached (crash/stall elsewhere) are requeued once.
         """
         leader = lane[0]
+        memory_exit = (leader.get('lane_exit') or {}).get('reason') == 'memory'
         for job in lane:
             job['done'], errors = validate_outputs(
                 job['outputs'], job.get('baseline') if self.options.force else None)
@@ -1467,17 +1473,20 @@ class Panel(QMainWindow):
                 job['status'] = '已完成'
             elif job.get('stop_reason') and job['stop_reason'] != LANE_STOP:
                 job['status'] = job['stop_reason']
+            elif (memory_exit and (not event or event.get('interrupted')) and not self.batch_stopped
+                  and job['memory_requeues'] < LANE_MEMORY_REQUEUES):
+                requeue = 'memory'  # stopped at a page boundary by the RAM limit; saved pages are kept
             elif event:
                 job['status'] = '失敗' if errors else '異常退出'
             elif job['lane_retries'] < 1 and not self.batch_stopped:
-                requeue = True
+                requeue = 'crash'
             else:
                 job['status'] = '異常退出' if not errors else '失敗'
-            job['error'] = '; '.join(errors[:10]) or event.get('error') or None
+            job['error'] = '; '.join([*errors[:10], *([event['error']] if event.get('error') else [])]) or None
             job['available'] = job['done']
             if self.options.force:
                 job['available'], _ = validate_outputs(job['outputs'])
-            self.job_message(job, f"Result={'requeued' if requeue else job['status']}; "
+            self.job_message(job, f"Result={'requeued (' + requeue + ')' if requeue else job['status']}; "
                              f"exit={job.get('exit_code')}; validated={job['done']}/{job['total']}; "
                              f"{job['error'] or ''}")
             job['end'] = time.monotonic()
@@ -1491,9 +1500,9 @@ class Panel(QMainWindow):
             requeue = job.pop('requeue')
             job.update(file=None, guard=None, process=None, finalized=True, lane_waiting=False)
             if requeue:
-                retries = job['lane_retries'] + 1
-                job.update(status='待處理', lane=None, lane_event=None, exit_seen=False, finalized=False,
-                           exit_code=None, exit_status=None, stop_reason=None, lane_retries=retries)
+                job.update(status='待處理', lane=None, lane_event=None, lane_exit=None, exit_seen=False,
+                           finalized=False, exit_code=None, exit_status=None, stop_reason=None)
+                job['memory_requeues' if requeue == 'memory' else 'lane_retries'] += 1
         process.deleteLater()
         token = self.run_generation
         QTimer.singleShot(0, lambda: self.schedule() if token == self.run_generation else None)

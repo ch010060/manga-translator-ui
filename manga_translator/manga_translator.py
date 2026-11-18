@@ -2002,7 +2002,7 @@ class MangaTranslator:
         self._batch_configs.clear()
         self.all_page_translations = []
         self._original_page_texts = []
-        self._colorizer_history_images = []
+        self._clear_colorizer_history()
         self._current_image_context = None
         self._saved_image_contexts = {}
         from .translators import translator_cache

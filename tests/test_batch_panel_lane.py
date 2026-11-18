@@ -27,7 +27,18 @@ root = books[0].parent
 with open(root / 'launches.jsonl', 'a') as f:
     f.write(json.dumps({'books': [b.name for b in books], 'lane': '--book-lane' in args,
                         'subprocess': '--subprocess' in args}) + '\n')
+def event(book, **extra):
+    print('[LANE_EVENT] ' + json.dumps(dict({'event': 'book_done', 'book': str(book), 'error': None, 'success': 2,
+                                             'failed': 0, 'skipped': 0, 'total': 2}, **extra)), flush=True)
 for n, book in enumerate(books):
+    memory_hit = book.name == 'b' and (mode == 'memory_always' or
+                                       (mode == 'memory_once' and not (root / 'memory_hit').exists()))
+    if memory_hit:  # what `local --book-lane` prints when the RAM limit interrupts a book
+        (root / 'memory_hit').write_text('1')
+        event(book, error='interrupted: system memory 96.0% > 95', interrupted='memory', success=0)
+        print('[LANE_EVENT] ' + json.dumps({'event': 'lane_exit', 'reason': 'memory',
+                                            'remaining': [str(b) for b in books[n + 1:]]}), flush=True)
+        sys.exit(3)
     if mode == 'crash_second_once' and n == 1 and not (root / 'crashed').exists():
         (root / 'crashed').write_text('1'); sys.exit(3)
     if mode == 'stop_second' and n == 1:
@@ -38,8 +49,7 @@ for n, book in enumerate(books):
             if force or not (result / s.name).exists():
                 Image.new('RGB', (8, 8), (1, 2, 3)).save(result / s.name)
     if '--book-lane' in args:
-        print('[LANE_EVENT] ' + json.dumps({'event': 'book_done', 'book': str(book), 'error': None,
-                                            'success': 2, 'failed': 0, 'skipped': 0, 'total': 2}), flush=True)
+        event(book)
 '''
 
 
@@ -125,6 +135,23 @@ class Cases(LaneTests):
         self.window.tick()
         self.assertEqual(jobs['c']['status'], '執行中')
         self.window.stop(); self.settled()
+
+    def test_memory_exit_requeues_without_using_crash_retry(self):
+        jobs = self.start(['a', 'b', 'c'], lane_books=3, mode='memory_once')
+        self.settled()
+        self.assertEqual({n: j['status'] for n, j in jobs.items()}, dict.fromkeys('abc', '已完成'))
+        self.assertEqual([l['books'] for l in self.launches()], [['a', 'b', 'c'], ['b', 'c']])
+        self.assertEqual({n: (j['memory_requeues'], j['lane_retries']) for n, j in jobs.items()},
+                         {'a': (0, 0), 'b': (1, 0), 'c': (1, 0)})
+
+    def test_memory_exit_is_bounded(self):
+        jobs = self.start(['a', 'b'], lane_books=2, mode='memory_always')
+        self.settled()
+        self.assertEqual(jobs['a']['status'], '已完成')
+        self.assertEqual(jobs['b']['status'], '失敗')  # interrupted every time, no valid outputs
+        self.assertEqual(jobs['b']['memory_requeues'], panel.LANE_MEMORY_REQUEUES)
+        self.assertEqual(len(self.launches()), 1 + panel.LANE_MEMORY_REQUEUES)
+        self.assertIn('interrupted', jobs['b']['error'])
 
     def test_lane_off_keeps_one_process_per_book(self):
         jobs = self.start(['a', 'b'], lane_books=0)

@@ -139,7 +139,8 @@ def apply_cli_overrides(config_dict, args):
         cli['batch_concurrent'] = True
 
 
-async def translate_files(input_paths, output_dir, config_service, verbose=False, overwrite=False, args=None, translator=None):
+async def translate_files(input_paths, output_dir, config_service, verbose=False, overwrite=False, args=None, translator=None,
+                          cancel_check=None):
     """翻译文件（使用 UI 层的逻辑）"""
     
     # 延迟导入，避免 --help 时加载所有模块
@@ -361,6 +362,8 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
         print("🔧 初始化翻译器...")
         translator = MangaTranslator(params=translator_params)
         print("✅ 翻译器初始化完成")
+    if cancel_check is not None:
+        translator.set_cancel_check_callback(cancel_check)
     
     # 创建 Config 对象
     explicit_keys = {'render', 'upscale', 'translator', 'detector', 'colorizer', 'inpainter', 'ocr'}
@@ -460,6 +463,7 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
 
     batch_size = cli_config.get('batch_size', 3)
     total_images = len(file_paths_with_configs)
+    batch_error = None
     total_batches = (total_images + batch_size - 1) // batch_size if batch_size > 0 else 1
     
     print(f"\n📊 批量处理模式：共 {total_images} 张图片，分 {total_batches} 个批次处理")
@@ -595,8 +599,11 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
         if verbose:
             import traceback
             traceback.print_exc()
+        batch_error = f'{type(e).__name__}: {e}'
+        # Count every page handed to the batch as failed: in the non-concurrent path
+        # images_with_configs is never filled, so counting it reported 0 failures.
         success_count = 0
-        failed_count = len(images_with_configs)
+        failed_count = total_images
     
     # 总结
     print(f"\n{'='*60}")
@@ -624,7 +631,7 @@ async def translate_files(input_paths, output_dir, config_service, verbose=False
         print(f"\n⚠️  输出目录不存在: {final_output_dir}")
     print()
     return {'success': success_count, 'failed': failed_count, 'skipped': skipped_count,
-            'total': len(all_files), 'translator': translator}
+            'total': len(all_files), 'translator': translator, 'error': batch_error}
 
 
 LANE_EVENT_PREFIX = '[LANE_EVENT] '
@@ -638,25 +645,75 @@ async def run_book_lane(args, config_service, verbose=False, overwrite=False):
     stdout; it is a notification only, callers must still validate outputs.
     """
     import json
+    over_memory = memory_guard(getattr(args, 'memory_percent', 0), getattr(args, 'memory_limit', 0))
+    tripped = {}
+
+    def cancel_check():
+        # Polled by translate_batch at batch/page boundaries; finished pages are already saved.
+        if 'reason' not in tripped:
+            reason = over_memory()
+            if reason:
+                tripped['reason'] = reason
+        return 'reason' in tripped
+
+    def emit(event):
+        print(LANE_EVENT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)
+
     translator = None
     failed_books = 0
-    for book in args.input:
-        stats, error = {}, None
+    for index, book in enumerate(args.input):
+        if index and over_memory():  # between books: do not take the next one
+            tripped['reason'] = over_memory()
+            emit({'event': 'lane_exit', 'reason': 'memory', 'detail': tripped['reason'],
+                  'remaining': [os.path.abspath(b) for b in args.input[index:]]})
+            return LANE_MEMORY_EXIT
+        stats, error, interrupted = {}, None, None
         try:
             stats = await translate_files([book], getattr(args, 'output', None), config_service,
                                           verbose=verbose, overwrite=overwrite, args=args,
-                                          translator=translator) or {}
+                                          translator=translator, cancel_check=cancel_check) or {}
             translator = stats.get('translator') or translator
+            error = stats.get('error')
+        except asyncio.CancelledError:
+            if 'reason' not in tripped:
+                raise
+            interrupted, error = 'memory', f"interrupted: {tripped['reason']}"
         except Exception as exc:  # keep the lane alive for the remaining books
             error = f'{type(exc).__name__}: {exc}'
         finally:
             if translator is not None:
                 translator.end_book()
         event = {'event': 'book_done', 'book': os.path.abspath(book), 'error': error,
+                 'interrupted': interrupted,
                  **{k: stats.get(k, 0) for k in ('success', 'failed', 'skipped', 'total')}}
         failed_books += bool(error or event['failed'])
-        print(LANE_EVENT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)
+        emit(event)
+        if interrupted:
+            emit({'event': 'lane_exit', 'reason': 'memory', 'detail': tripped['reason'],
+                  'remaining': [os.path.abspath(b) for b in args.input[index + 1:]]})
+            return LANE_MEMORY_EXIT
     return failed_books
+
+
+LANE_MEMORY_EXIT = 'memory'
+
+
+def memory_guard(percent_limit=0, mb_limit=0):
+    """Return a check() -> reason|None for the lane, mirroring subprocess mode's limits."""
+    import psutil
+    process = psutil.Process()
+
+    def over_memory():
+        if percent_limit and percent_limit > 0:
+            used = psutil.virtual_memory().percent
+            if used > percent_limit:
+                return f'system memory {used:.1f}% > {percent_limit}%'
+        if mb_limit and mb_limit > 0:
+            rss = process.memory_info().rss / 1024 / 1024
+            if rss > mb_limit:
+                return f'process memory {rss:.0f} MB > {mb_limit} MB'
+        return None
+    return over_memory
 
 
 async def run_local_mode(args):
@@ -846,7 +903,7 @@ async def run_local_mode(args):
         except KeyboardInterrupt:
             print("\n\n⚠️  用户取消")
             sys.exit(0)
-        sys.exit(1 if failed_books else 0)
+        sys.exit(3 if failed_books == LANE_MEMORY_EXIT else 1 if failed_books else 0)
     else:
         # 原有的直接模式
         try:

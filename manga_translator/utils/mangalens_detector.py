@@ -244,6 +244,7 @@ class MangaLensBubbleDetector(ModelWrapper):
         self._torch_device = torch_device
         self._session_device = torch_device.type
         self.logger.debug(f"MangaLens model loaded: {self.model_path} (device={self._session_device})")
+        print(f'[model-load] MangaLens device={self._session_device}', flush=True)
         return self.model
 
     def unload_model(self):
