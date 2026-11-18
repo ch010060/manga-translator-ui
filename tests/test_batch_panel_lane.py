@@ -209,6 +209,18 @@ class Cases(LaneTests):
     def test_memory_resume_with_overwrite_redoes_pages_but_terminates(self):
         self.assertEqual(self.resumed_page_runs(force=True), [2, 2])  # documented trade-off: page 1 redone
 
+    def test_gui_default_lane_uses_book_lane_without_subprocess(self):
+        for name in 'abcde':
+            self.book(name)
+        self.window.advanced['lane_books'] = self.window.defaults['lane_books']  # harness pins 0; use GUI default
+        self.assertEqual(self.window.advanced['lane_books'], 4)
+        self.launch()
+        self.settled()
+        jobs = {j['book'].name: j for j in self.window.jobs}
+        self.assertEqual({n: j['status'] for n, j in jobs.items()}, dict.fromkeys('abcde', '已完成'))
+        self.assertEqual(sorted(l['books'] for l in self.launches()), [['a', 'b', 'c', 'd'], ['e']])
+        self.assertTrue(all(l['lane'] and not l['subprocess'] for l in self.launches()))
+
     def test_lane_off_keeps_one_process_per_book(self):
         jobs = self.start(['a', 'b'], lane_books=0)
         self.settled()

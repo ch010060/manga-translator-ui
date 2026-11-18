@@ -110,6 +110,7 @@ class P0Tests(unittest.TestCase):
         self.window.config.setText(str(self.config))
         self.window.root.setText(str(self.root))
         self.window.stall.setValue(0)
+        self.window.advanced['lane_books'] = 0  # these suites cover legacy one-process-per-book mode
         self.heartbeats = 0
         self.heartbeat = QTimer()
         self.heartbeat.timeout.connect(self.beat)

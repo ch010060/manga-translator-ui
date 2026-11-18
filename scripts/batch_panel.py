@@ -44,6 +44,10 @@ LANE_EVENT_PREFIX = '[LANE_EVENT] '  # printed by `local --book-lane`, one JSON 
 LANE_STOP = '__lane__'  # stop reason for a lane leader stopped on behalf of another book
 LANE_MEMORY_REQUEUES = 3  # per book, only when the book was running when the RAM limit stopped the lane
 LANE_MEMORY_STREAK = 5  # consecutive RAM-limit lane exits with no book completed -> stop scheduling
+# Batch Console defaults validated on Windows RTX 5090 (12 books / 226 pages, Sakura server resident):
+# 3 concurrent lanes, 1 page per translation batch, 4 books per persistent lane. GUI-only: the headless
+# CLI keeps its own parse_args() defaults.
+GUI_DEFAULTS = {'concurrency': 3, 'batch_size': 1, 'lane_books': 4}
 
 
 THEME = {
@@ -510,7 +514,7 @@ class Panel(QMainWindow):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.settings = QSettings('MangaTranslator', 'BatchPanel')
-        self.defaults = vars(batch.parse_args(['--root', '.']))
+        self.defaults = {**vars(batch.parse_args(['--root', '.'])), **GUI_DEFAULTS}
         self.advanced = {key: self.defaults[key] for key in (
             'attempts', 'timeout', 'memory_limit', 'memory_percent', 'batch_per_restart',
             'lane_books', 'intra_book_concurrent', 'use_subprocess')}
@@ -1082,7 +1086,7 @@ class Panel(QMainWindow):
         overwrite.setObjectName('force')
         overwrite.setChecked(draft['force'])
         layout.addWidget(overwrite)
-        reset = QPushButton('還原腳本預設（包含主畫面參數）')
+        reset = QPushButton('還原 GUI 預設（包含主畫面參數）')
         reset.setObjectName('reset_batch_defaults')
         layout.addWidget(reset)
         def reset_values():
