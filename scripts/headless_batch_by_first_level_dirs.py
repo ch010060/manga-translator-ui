@@ -499,6 +499,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_BATCH_PER_RESTART,
         help=f"Local subprocess restart interval. Default: {DEFAULT_BATCH_PER_RESTART}.",
     )
+    parser.add_argument(
+        "--lane-books",
+        type=int,
+        default=0,
+        help="Batch Console only: books per persistent lane process (0 = one process per book).",
+    )
     parser.add_argument("local_args", nargs=argparse.REMAINDER, help="Extra args after -- are passed to local mode.")
     return parser.parse_args(argv)
 

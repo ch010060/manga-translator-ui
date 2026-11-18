@@ -682,6 +682,9 @@ async def run_local_mode(args):
     if getattr(args, 'no_overwrite', False):
         overwrite = False
     
+    if use_subprocess and getattr(args, 'book_lane', False):
+        print("ℹ️ --book-lane 已啟用，忽略 --subprocess（lane 本身即為有限生命週期的 worker）")
+        use_subprocess = False
     if use_subprocess:
         # 子进程模式
         print("\n🔧 启用子进程模式（支持内存管理）")

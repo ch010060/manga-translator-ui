@@ -37,9 +37,11 @@ BATCH_RANGES = {
     'concurrency': (1, 2147483647), 'batch_size': (1, 2147483647),
     'stall_timeout': (0, 2147483647), 'attempts': (-1, 2147483647),
     'timeout': (0, 2147483647), 'memory_limit': (0, 2147483647),
-    'memory_percent': (0, 100), 'batch_per_restart': (0, 2147483647),
+    'memory_percent': (0, 100), 'batch_per_restart': (0, 2147483647), 'lane_books': (0, 64),
 }
 BATCH_FLAGS = ('intra_book_concurrent', 'use_subprocess', 'force')
+LANE_EVENT_PREFIX = '[LANE_EVENT] '  # printed by `local --book-lane`, one JSON object per book
+LANE_STOP = '__lane__'  # stop reason for a lane leader stopped on behalf of another book
 
 
 THEME = {
@@ -509,7 +511,7 @@ class Panel(QMainWindow):
         self.defaults = vars(batch.parse_args(['--root', '.']))
         self.advanced = {key: self.defaults[key] for key in (
             'attempts', 'timeout', 'memory_limit', 'memory_percent', 'batch_per_restart',
-            'intra_book_concurrent', 'use_subprocess')}
+            'lane_books', 'intra_book_concurrent', 'use_subprocess')}
         self.follow = self.settings.value('follow', False, type=bool)
         self.notify = self.settings.value('notify', True, type=bool)
         self.auto_scan = self.settings.value('auto_scan', True, type=bool)
@@ -1059,6 +1061,7 @@ class Panel(QMainWindow):
             ('memory_limit', '固定記憶體限制（MB，0 關閉）'),
             ('memory_percent', '記憶體比例限制（%，0 關閉）'),
             ('batch_per_restart', '每隔幾批重啟（0 關閉）'),
+            ('lane_books', '持久 Lane：每程序處理本數（0 關閉＝每本一程序；啟用時不使用子程序模式）'),
         ):
             widget = QSpinBox()
             widget.setObjectName(key)
@@ -1188,6 +1191,7 @@ class Panel(QMainWindow):
                    start=None, end=None, complete=None, exit_code=None, exit_status=None,
                    stop_reason=None, error=None, tail='', decoder=None, path=None, file=None,
                    baseline={}, snapshot={}, exit_seen=False, finalized=False,
+                   lane=None, lane_event=None, lane_waiting=False, lane_retries=0, event_buf='',
                    run_id=self.run_generation, status='待處理' if selected else '未選取')
         if selected and self.options.force:
             job['done'] = 0
@@ -1232,7 +1236,7 @@ class Panel(QMainWindow):
         self.options = batch.BatchOptions(
             config=Path(self.config.text()).resolve(), force=self.force.isChecked(),
             use_gpu=False, batch_size=self.batch_size.value(),
-            **{key: value for key, value in self.advanced.items() if key != 'timeout'},
+            **{key: value for key, value in self.advanced.items() if key not in ('timeout', 'lane_books')},
         )
         self.reset_summary()
         self.run_generation += 1
@@ -1254,12 +1258,17 @@ class Panel(QMainWindow):
     def schedule(self):
         if self.lifecycle != Lifecycle.RUNNING:
             return
-        active = sum(j['process'] is not None for j in self.jobs)
+        active = len({id(j['process']) for j in self.jobs if j['process'] is not None})
+        lane_books = self.advanced.get('lane_books', 0)
         for job in self.jobs:
             if active >= self.concurrent.value():
                 break
             if job['status'] != '待處理':
                 continue
+            # Persistent lane: one process translates several books in order (models load once).
+            group = [job]
+            if lane_books:
+                group += [j for j in self.jobs if j is not job and j['status'] == '待處理'][:lane_books - 1]
             logs = batch.PROJECT_ROOT / 'result' / 'batch_logs'
             logs.mkdir(parents=True, exist_ok=True)
             path = batch.make_log_path(logs, self.jobs.index(job) + 1, job['book'].name)
@@ -1278,6 +1287,11 @@ class Panel(QMainWindow):
             env.insert('PYTHONIOENCODING', 'utf-8')
             process.setProcessEnvironment(env)
             command = batch.build_local_command(Path(sys.executable), job['book'], self.options)
+            if lane_books:
+                at = command.index('-i')
+                command[at + 1:at + 2] = [str(j['book']) for j in group]
+                # A lane is its own bounded worker; subprocess mode would restart per book/page instead.
+                command = [arg for arg in command if arg != '--subprocess'] + ['--book-lane']
             if os.name == 'nt':
                 try:
                     job['guard'] = WindowsJob()
@@ -1290,12 +1304,18 @@ class Panel(QMainWindow):
                     job['file'] = None
                     process.deleteLater()
                     continue
-            job['baseline'] = output_snapshot(job['outputs'])
-            job['snapshot'] = job['baseline']
-            if self.options.force:
-                job['done'] = 0
-            job.update(process=process, status='執行中', start=time.monotonic(),
-                       last=time.monotonic(), decoder=codecs.getincrementaldecoder('utf-8')('replace'))
+            now = time.monotonic()
+            for member in group:
+                member['baseline'] = output_snapshot(member['outputs'])
+                member['snapshot'] = member['baseline']
+                if self.options.force:
+                    member['done'] = 0
+                member.update(process=process, status='執行中', start=now, last=now,
+                              decoder=codecs.getincrementaldecoder('utf-8')('replace'),
+                              lane=group if lane_books else None, lane_event=None, event_buf='',
+                              lane_waiting=member is not job)
+                if member is not job:  # share the leader's log file and job object
+                    member.update(path=job['path'], file=job['file'], guard=job.get('guard'))
             token = job['run_id']
             process.readyReadStandardOutput.connect(lambda j=job, p=process, t=token:
                                                     self.drain(j) if self.owns_callback(j, p, t) else None)
@@ -1322,7 +1342,39 @@ class Panel(QMainWindow):
         if job['file']:
             job['file'].write(data)
             job['file'].flush()
-        job['tail'] = (job['tail'] + job['decoder'].decode(data))[-60000:]
+        text = job['decoder'].decode(data)
+        job['tail'] = (job['tail'] + text)[-60000:]
+        if job.get('lane'):
+            self.lane_events(job, text)
+
+    @staticmethod
+    def same_path(a, b):
+        return os.path.normcase(os.path.realpath(str(a))) == os.path.normcase(os.path.realpath(str(b)))
+
+    def lane_events(self, leader, text):
+        """Record per-book `[LANE_EVENT]` notifications; outputs are still validated at finalize."""
+        lane = leader['lane']
+        buf = leader['event_buf'] + text
+        *lines, leader['event_buf'] = buf.split('\n')
+        for line in lines:
+            at = line.find(LANE_EVENT_PREFIX)
+            if at < 0:
+                continue
+            try:
+                event = json.loads(line[at + len(LANE_EVENT_PREFIX):])
+            except ValueError:
+                continue
+            for member in lane:
+                if member['lane_event'] is None and self.same_path(member['book'], event.get('book', '')):
+                    member['lane_event'] = event
+                    member['lane_waiting'] = False
+                    break
+            nxt = next((m for m in lane if m['lane_event'] is None), None)
+            if nxt is not None and nxt['lane_waiting']:
+                now = time.monotonic()
+                nxt.update(lane_waiting=False, start=now, last=now)
+        for member in lane[1:]:
+            member['tail'] = leader['tail']
 
     def process_error(self, job, error):
         if job['process'] is not None and error == QProcess.ProcessError.FailedToStart:
@@ -1342,8 +1394,8 @@ class Panel(QMainWindow):
             return
         job['exit_seen'] = True
         self.drain(job)
-        job['exit_code'] = code
-        job['exit_status'] = exit_status
+        for member in job.get('lane') or (job,):
+            member.update(exit_seen=True, exit_code=code, exit_status=exit_status)
         if job.get('cleanup') is not None:
             return  # Cleanup controller must verify the entire job first.
         process, token = job['process'], job['run_id']
@@ -1364,6 +1416,9 @@ class Panel(QMainWindow):
 
     def finalize_job(self, job):
         if job['process'] is None or job.get('finalized'):
+            return
+        if job.get('lane'):
+            self.finalize_lane(job['lane'])
             return
         job['done'], errors = validate_outputs(
             job['outputs'], job.get('baseline') if self.options.force else None)
@@ -1395,7 +1450,64 @@ class Panel(QMainWindow):
         QTimer.singleShot(0, lambda: self.schedule() if token == self.run_generation else None)
         self.sync_ui()
 
+    def finalize_lane(self, lane):
+        """Finalize every book of a lane from its own validated outputs, then release the shared process.
+
+        A lane event is a notification only: a book is complete when its outputs validate.
+        Books the lane never reached (crash/stall elsewhere) are requeued once.
+        """
+        leader = lane[0]
+        for job in lane:
+            job['done'], errors = validate_outputs(
+                job['outputs'], job.get('baseline') if self.options.force else None)
+            event = job.get('lane_event') or {}
+            ok_event = bool(event) and not event.get('error') and not event.get('failed')
+            requeue = False
+            if ok_event and not errors:
+                job['status'] = '已完成'
+            elif job.get('stop_reason') and job['stop_reason'] != LANE_STOP:
+                job['status'] = job['stop_reason']
+            elif event:
+                job['status'] = '失敗' if errors else '異常退出'
+            elif job['lane_retries'] < 1 and not self.batch_stopped:
+                requeue = True
+            else:
+                job['status'] = '異常退出' if not errors else '失敗'
+            job['error'] = '; '.join(errors[:10]) or event.get('error') or None
+            job['available'] = job['done']
+            if self.options.force:
+                job['available'], _ = validate_outputs(job['outputs'])
+            self.job_message(job, f"Result={'requeued' if requeue else job['status']}; "
+                             f"exit={job.get('exit_code')}; validated={job['done']}/{job['total']}; "
+                             f"{job['error'] or ''}")
+            job['end'] = time.monotonic()
+            job['requeue'] = requeue
+        if leader['file']:
+            leader['file'].close()
+        if leader.get('guard') is not None:
+            leader['guard'].close()
+        process = leader['process']
+        for job in lane:
+            requeue = job.pop('requeue')
+            job.update(file=None, guard=None, process=None, finalized=True, lane_waiting=False)
+            if requeue:
+                retries = job['lane_retries'] + 1
+                job.update(status='待處理', lane=None, lane_event=None, exit_seen=False, finalized=False,
+                           exit_code=None, exit_status=None, stop_reason=None, lane_retries=retries)
+        process.deleteLater()
+        token = self.run_generation
+        QTimer.singleShot(0, lambda: self.schedule() if token == self.run_generation else None)
+        self.sync_ui()
+
     def terminate_job(self, job, status, detail=''):
+        if job.get('lane') and job is not job['lane'][0]:
+            # The lane shares one process: record this book's reason, stop via the leader.
+            job['stop_reason'] = status
+            self.job_message(job, f'{status} requested. {detail}')
+            leader = job['lane'][0]
+            if leader.get('cleanup') is None:
+                self.terminate_job(leader, LANE_STOP, detail)
+            return
         process = job['process']
         if process is None or job.get('cleanup') is not None:
             return
@@ -1474,7 +1586,7 @@ class Panel(QMainWindow):
         return {
             'books': len(jobs), 'completed': sum(j['status'] == '已完成' for j in jobs),
             'failed': sum(j['status'] in failed for j in jobs),
-            'running': sum(j['process'] is not None for j in jobs),
+            'running': sum(j['process'] is not None and not j.get('lane_waiting') for j in jobs),
             'stopped': sum(j['status'] == '已停止' for j in jobs),
             'pages_total': sum(j['total'] for j in jobs), 'pages_done': progress,
             'pages_before': before, 'pages_available': sum(j['available'] for j in jobs),
@@ -1495,7 +1607,9 @@ class Panel(QMainWindow):
                 done = (sum(signature != job['baseline'].get(path) for path, signature in snapshot.items())
                         if self.options.force else len(snapshot))
                 job['done'] = done
-                if self.advanced['timeout'] and now - job['start'] >= self.advanced['timeout']:
+                if job.get('lane_waiting') or job.get('lane_event'):
+                    pass  # not started yet / already reported: the lane's current book carries the clocks
+                elif self.advanced['timeout'] and now - job['start'] >= self.advanced['timeout']:
                     self.terminate_job(job, '總時間逾時')
                 elif self.stall.value() and now - job['last'] >= self.stall.value():
                     self.terminate_job(job, '停滯逾時')
@@ -1517,7 +1631,8 @@ class Panel(QMainWindow):
     def render_job_row(self, row, job):
         status = job['status']
         # Queue wording is display-only; scheduling still uses the original raw status.
-        display = '排隊中' if status == '待處理' and self.lifecycle == Lifecycle.RUNNING else status
+        display = ('排隊中' if (status == '待處理' and self.lifecycle == Lifecycle.RUNNING) or job.get('lane_waiting')
+                   else status)
         item = self.table.item(row, 1)
         if item.text() != display or item.data(Qt.ItemDataRole.UserRole) != status:
             icon, tone = STATUS_PRESENTATION.get(display, ('clock', 'muted'))

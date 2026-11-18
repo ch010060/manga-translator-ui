@@ -232,7 +232,7 @@ class P2Tests(unittest.TestCase):
     def test_initial_values_follow_parser_not_copied_constants(self):
         original=panel.batch.parse_args
         overrides=dict(concurrency=7,batch_size=9,stall_timeout=17,attempts=-1,timeout=23,
-                       memory_limit=456,memory_percent=60,batch_per_restart=2,
+                       memory_limit=456,memory_percent=60,batch_per_restart=2,lane_books=3,
                        intra_book_concurrent=True,use_subprocess=False,force=True)
         def parser(argv):
             result=original(argv)
