@@ -44,7 +44,7 @@ Select-String -Path result\batch_logs\*.log -Pattern "系统内存超过限制" 
 | 程序 | 每本書 1 個父程序 + 子程序 | 每 lane 1 個程序，依序處理 ≤ N 本 |
 | 模型載入 | 每本書（+ 每次記憶體保護重啟） | 每 lane 1 次 |
 | `--subprocess` | 有 | **自動移除**（lane 本身即有限生命週期 worker） |
-| 95% 記憶體保護 | 有（超限 → 子程序重開） | **有**：沿用 `--memory-percent/--memory-limit`；超限時在批次／頁面邊界停止（已存頁保留），lane 不再領下一本，送 `lane_exit`；GUI 將被中斷與未輪到的書重排（每本最多 3 次，不佔崩潰重排額度） |
+| 95% 記憶體保護 | 有（超限 → 子程序重開） | **有**：沿用 `--memory-percent/--memory-limit`；超限時在批次／頁面邊界停止（已存頁保留），lane 不再領下一本，送 `lane_exit`；GUI 重排：執行中被中斷的書每本最多 3 次（不佔崩潰重排額度）；尚未開始的書重排不計次；連續 5 條 lane 因 RAM 退出且沒有任何書完成時停止排程，剩餘書標記「已停止」 |
 | 翻譯分組 | 每頁一個 Sakura 請求 | **依 `批次大小` 分批**（同一本書內；不跨書） |
 | 完成判定 | 程序退出 + 驗證輸出 | 每本書各自驗證輸出（`[LANE_EVENT]` 只是通知） |
 | 中途崩潰 | 該本書異常退出 | 已完成的書保留；未輪到的書重新排隊 1 次 |
@@ -90,6 +90,7 @@ python -m pytest tests\test_book_lane.py tests\test_batch_panel_lane.py -q
 | 記憶體 | 無持續上升；每個 lane 結束後回落 |
 | 效能 | N3-b1 兩輪平均 wall < L3 兩輪平均，且差距大於 L3 兩輪間差異 |
 | 故障 | 若有 lane 崩潰：已完成的書保留、未完成的書重排一次後完成 |
+| RAM 中斷續跑 | 若有 `lane_exit`（RAM）：被中斷的書續跑後頁數完整、無重複輪迴；不覆寫模式下中斷前已存的頁未被重寫 |
 
 ## P0-D（有條件）
 只有 P0-C 全部通過、且 Lane 3 的 Dedicated GPU 峰值仍有 ≥ 4 GB 餘裕時，再測同時處理 4（持久 Lane 4）。不測 5，除非 4 也有餘裕。
@@ -123,5 +124,7 @@ python -m pytest tests\test_book_lane.py tests\test_batch_panel_lane.py tests\te
 
 ## 已知限制 / 待辦
 - GUI 逐書狀態要等整條 lane 結束才結算（一條 lane 5 本時，前 4 本會顯示執行中直到第 5 本結束）。不影響正確性，排在 P0-C 之後處理（review P1）。
-- `lane_exit` 記憶體重排上限每本 3 次；覆寫模式（force）下重排會重做已完成頁，不覆寫模式則會跳過已存頁。
+- 記憶體重排：執行中被中斷的書每本最多 3 次；未開始的書不計次；連續 5 次 RAM 退出且無書完成 → 停止排程（全域煞車）。
+- 覆寫模式（force）下重排會重做該書已完成的頁（測試鎖定為已知取捨，且保證會結束）；不覆寫模式會保留已存頁、只補缺頁。
+- RAM 保護不等於 VRAM 保護：Shared GPU Memory 遷移可能在 RAM < 95% 時就發生；`cancel_check` 也無法中斷進行中的單次 GPU 推論。VRAM 由 P0-C 的 Dedicated／Shared 時序驗證。
 - 書內並行（`--concurrent`）在 Mac 上結束時會 segfault（exit 139，輸出正確），未納入 lane，勿同時開啟。

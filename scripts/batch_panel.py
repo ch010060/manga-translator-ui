@@ -42,7 +42,8 @@ BATCH_RANGES = {
 BATCH_FLAGS = ('intra_book_concurrent', 'use_subprocess', 'force')
 LANE_EVENT_PREFIX = '[LANE_EVENT] '  # printed by `local --book-lane`, one JSON object per book
 LANE_STOP = '__lane__'  # stop reason for a lane leader stopped on behalf of another book
-LANE_MEMORY_REQUEUES = 3  # per book: lane stopped by the RAM limit; separate from the one crash retry
+LANE_MEMORY_REQUEUES = 3  # per book, only when the book was running when the RAM limit stopped the lane
+LANE_MEMORY_STREAK = 5  # consecutive RAM-limit lane exits with no book completed -> stop scheduling
 
 
 THEME = {
@@ -1245,6 +1246,7 @@ class Panel(QMainWindow):
         self.started = time.monotonic()
         self.ended = None
         self.batch_stopped = False
+        self.lane_memory_streak = 0
         self.stats.setStyleSheet('')
         selected_ids = {id(job) for job in selected}
         for job, outputs in zip(self.jobs, output_sets):
@@ -1473,7 +1475,9 @@ class Panel(QMainWindow):
                 job['status'] = '已完成'
             elif job.get('stop_reason') and job['stop_reason'] != LANE_STOP:
                 job['status'] = job['stop_reason']
-            elif (memory_exit and (not event or event.get('interrupted')) and not self.batch_stopped
+            elif memory_exit and not event and not self.batch_stopped:
+                requeue = 'unstarted'  # the lane stopped before this book: no attempt is charged
+            elif (memory_exit and event.get('interrupted') and not self.batch_stopped
                   and job['memory_requeues'] < LANE_MEMORY_REQUEUES):
                 requeue = 'memory'  # stopped at a page boundary by the RAM limit; saved pages are kept
             elif event:
@@ -1496,13 +1500,29 @@ class Panel(QMainWindow):
         if leader.get('guard') is not None:
             leader['guard'].close()
         process = leader['process']
+        # Global brake: if the RAM limit keeps stopping lanes before any book completes, new lanes
+        # would only hit it again. Stop scheduling instead of cycling processes.
+        if any(job['status'] == '已完成' for job in lane):
+            self.lane_memory_streak = 0
+        if memory_exit:
+            self.lane_memory_streak = getattr(self, 'lane_memory_streak', 0) + 1
+        brake = memory_exit and self.lane_memory_streak >= LANE_MEMORY_STREAK
         for job in lane:
             requeue = job.pop('requeue')
             job.update(file=None, guard=None, process=None, finalized=True, lane_waiting=False)
             if requeue:
                 job.update(status='待處理', lane=None, lane_event=None, lane_exit=None, exit_seen=False,
                            finalized=False, exit_code=None, exit_status=None, stop_reason=None)
-                job['memory_requeues' if requeue == 'memory' else 'lane_retries'] += 1
+                if requeue in ('memory', 'crash'):
+                    job['memory_requeues' if requeue == 'memory' else 'lane_retries'] += 1
+        if brake:
+            reason = (f'RAM limit stopped {self.lane_memory_streak} lanes in a row with no book completed; '
+                      f'scheduling stopped')
+            self.batch_stopped = True
+            for job in self.jobs:
+                if job['status'] == '待處理':
+                    job.update(status='已停止', error=reason)
+            self.job_message(leader, reason)
         process.deleteLater()
         token = self.run_generation
         QTimer.singleShot(0, lambda: self.schedule() if token == self.run_generation else None)
