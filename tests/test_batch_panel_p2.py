@@ -31,7 +31,7 @@ class P2Tests(unittest.TestCase):
         self.window.batch_size.setValue(9)
         self.window.stall.setValue(123)
         self.window.advanced.update(attempts=8,timeout=111,memory_limit=222,
-                                    memory_percent=44,batch_per_restart=3,
+                                    memory_percent=44,batch_per_restart=3,lane_books=2,
                                     intra_book_concurrent=True,use_subprocess=False)
         self.window.force.setChecked(True)
 
@@ -181,7 +181,10 @@ class P2Tests(unittest.TestCase):
     def test_R12_defaults_match_current_headless_parser(self):
         current=vars(panel.batch.parse_args(['--root','.']))
         expected={key:current[key] for key in (*panel.BATCH_RANGES,*panel.BATCH_FLAGS)}
-        self.assertEqual(self.window.batch_settings_snapshot(),expected)
+        expected.update(panel.GUI_DEFAULTS)  # validated GUI-only defaults override the headless parser
+        # The shared harness pins lane_books=0 for legacy suites, so compare the defaults themselves;
+        # a fresh Panel's initial values are covered in test_batch_panel_defaults.py.
+        self.assertEqual(self.window.default_batch_settings(),expected)
         self.different_values(); self.dialog_action(self.reset)
         self.assertEqual(self.window.batch_settings_snapshot(),expected)
 
@@ -232,7 +235,7 @@ class P2Tests(unittest.TestCase):
     def test_initial_values_follow_parser_not_copied_constants(self):
         original=panel.batch.parse_args
         overrides=dict(concurrency=7,batch_size=9,stall_timeout=17,attempts=-1,timeout=23,
-                       memory_limit=456,memory_percent=60,batch_per_restart=2,
+                       memory_limit=456,memory_percent=60,batch_per_restart=2,lane_books=3,
                        intra_book_concurrent=True,use_subprocess=False,force=True)
         def parser(argv):
             result=original(argv)
@@ -241,7 +244,8 @@ class P2Tests(unittest.TestCase):
         with patch.object(panel.batch,'parse_args',side_effect=parser):
             other=panel.Panel()
             try:
-                self.assertEqual(overrides,other.batch_settings_snapshot())
+                # Parser values flow through, except the validated GUI-only defaults which win.
+                self.assertEqual({**overrides,**panel.GUI_DEFAULTS},other.batch_settings_snapshot())
             finally:
                 other.close()
 
