@@ -77,6 +77,8 @@ def create_parser():
                              help='批量处理大小（覆盖配置文件）')
     local_parser.add_argument('--attempts', type=int, default=None,
                              help='翻译失败重试次数，-1表示无限重试（覆盖配置文件）')
+    local_parser.add_argument('--book-lane', action='store_true',
+                             help='每個 -i 路徑視為獨立一本書，在同一程序內依序處理（模型只載入一次，批次不跨書）')
     local_parser.add_argument('--concurrent', action='store_true',
                              help='启用并发流水线模式（检测、OCR、翻译、渲染并行处理）')
     # 内存管理参数（子进程模式）

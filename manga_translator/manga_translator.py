@@ -1992,6 +1992,25 @@ class MangaTranslator:
             f"total={snapshot['total_mb']:.1f}MB"
         )
     
+    def end_book(self):
+        """Reset per-book state so a persistent worker can start the next book clean.
+
+        Keeps detector/OCR/inpainting model caches (module-level) and the translator
+        instances; clears translation history, page/image contexts and colorizer history.
+        """
+        self._batch_contexts.clear()
+        self._batch_configs.clear()
+        self.all_page_translations = []
+        self._original_page_texts = []
+        self._colorizer_history_images = []
+        self._current_image_context = None
+        self._saved_image_contexts = {}
+        from .translators import translator_cache
+        for cached in translator_cache.values():
+            if hasattr(cached, 'set_prev_context'):
+                cached.set_prev_context('')
+        self._cleanup_gpu_memory(aggressive=True)
+
     def _cleanup_context_memory(self, ctx, keep_result=True):
         """
         清理单个上下文的中间数据（用于特殊模式）
